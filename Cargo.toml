@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gpudb-api",
+    "crates/gpudb-examples",
+]
+
+# Common profile settings for all workspace members
+[profile.release]
+debug = false  # Disable debug symbols for production builds
+
+[profile.dev]
+opt-level = 0
+
+[profile.bench]
+debug = false  # Disable debug symbols for benchmarks

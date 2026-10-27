@@ -1,0 +1,117 @@
+[package]
+name = "gpudb-examples"
+version = "0.1.0"
+publish = false
+edition = "2021"
+description = "Examples for the gpudb-api Kinetica client library"
+
+[features]
+default = []
+# Enable SQLx examples (requires PostgreSQL wire protocol)
+sqlx = ["gpudb-api/sqlx", "dep:sqlx", "dep:futures"]
+
+[lib]
+name = "gpudb_examples"
+path = "src/lib.rs"
+
+[dependencies]
+# The main library - use debug or release based on build profile
+gpudb-api = { path = "../gpudb-api" }
+
+# Optional: SQLx for PostgreSQL wire protocol examples
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = true }
+futures = { version = "0.3", optional = true }
+
+# Dependencies used by examples
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
+serde_avro_fast = "2.0"
+rand = "0.9"
+hostname = "0.4"
+serde_bytes = "0.11"
+smallvec = "1.13"  # For ShardKeyValues
+env_logger = "0.11"  # For logging output
+
+[[bin]]
+name = "bulk_insert_mt_bin"
+path = "src/bin/bulk_insert_mt_bin.rs"
+
+[[bin]]
+name = "bulk_insert_mt_fast"
+path = "src/bin/bulk_insert_mt_fast.rs"
+
+[[bin]]
+name = "bulk_insert_mt_json"
+path = "src/bin/bulk_insert_mt_json.rs"
+
+[[bin]]
+name = "clear_table"
+path = "src/bin/clear_table.rs"
+
+[[bin]]
+name = "complete_workflow"
+path = "src/bin/complete_workflow.rs"
+
+[[bin]]
+name = "create_table"
+path = "src/bin/create_table.rs"
+
+[[bin]]
+name = "create_type"
+path = "src/bin/create_type.rs"
+
+[[bin]]
+name = "execute_sql"
+path = "src/bin/execute_sql.rs"
+
+[[bin]]
+name = "has_table"
+path = "src/bin/has_table.rs"
+
+[[bin]]
+name = "has_type"
+path = "src/bin/has_type.rs"
+
+[[bin]]
+name = "insert_and_get_records_bin"
+path = "src/bin/insert_and_get_records_bin.rs"
+
+[[bin]]
+name = "insert_and_get_records_json"
+path = "src/bin/insert_and_get_records_json.rs"
+
+[[bin]]
+name = "load_generator"
+path = "src/bin/load_generator.rs"
+
+[[bin]]
+name = "cleanup_all"
+path = "src/bin/cleanup_all.rs"
+
+[[bin]]
+name = "schema_builder_demo"
+path = "src/bin/schema_builder_demo.rs"
+
+[[bin]]
+name = "shard_key_computation"
+path = "src/bin/shard_key_computation.rs"
+
+[[bin]]
+name = "insert_all_sharded_types"
+path = "src/bin/insert_all_sharded_types.rs"
+
+[[bin]]
+name = "insert_sharded_aware"
+path = "src/bin/insert_sharded_aware.rs"
+
+[[bin]]
+name = "sqlx_example"
+path = "src/bin/sqlx_example.rs"
+required-features = ["sqlx"]
+
+[[bin]]
+name = "sqlx_complex_types"
+path = "src/bin/sqlx_complex_types.rs"
+required-features = ["sqlx"]

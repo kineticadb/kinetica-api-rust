@@ -1,0 +1,105 @@
+[package]
+name = "gpudb-api"
+# Written from the repository's VERSION by the schema-processing script in
+# gpudb-generators: MAJOR.MINOR.REVISION-ABI
+version = "7.2.3-0"
+edition = "2021"
+# The oldest toolchain the crate builds with
+rust-version = "1.88"
+description = "Async client for the Kinetica database"
+# The MIT license asks for its text in every copy, and Cargo packs only what is
+# under this directory, so the crate keeps a copy of the repository's LICENSE;
+# make-dist.sh and publish-crates.sh refuse a copy that differs
+license = "MIT"
+homepage = "https://www.kinetica.com/"
+documentation = "https://docs.kinetica.com/content/api/rust/"
+repository = "https://github.com/kineticadb/kinetica-api-rust"
+# The repository's README, which is the crate's page on crates.io; its links are
+# absolute, as crates.io resolves relative ones from this crate's directory
+readme = "../../README.md"
+keywords = ["kinetica", "gpudb", "database", "sql", "client"]
+categories = ["database", "api-bindings", "asynchronous"]
+# Test fixtures (the trust store tests' keys and keystores), read from the
+# repository when the tests run; nothing builds from them
+exclude = ["src/testdata"]
+
+# docs.rs documents the default features alone unless told otherwise
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+# Enable SQLx support for PostgreSQL wire protocol connections
+sqlx = ["dep:sqlx"]
+
+[dependencies]
+# Network & Async
+tokio = { version = "1", features = ["full"] }
+url = "2.5"
+flume = "0.11"  # Fast MPMC channel for bulk inserter
+# Direct hyper for high-performance HTTP
+hyper = { version = "1.8", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+# The TCP connector: socket options as the Java client sets them
+socket2 = { version = "0.6", features = ["all"] }
+tower-service = "0.3"
+# TLS. rustls rather than native-tls: a pure-Rust stack avoids a system OpenSSL
+# dependency on every target an application builds for.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "native-tokio", "webpki-tokio", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = "1"
+
+http-body-util = "0.1"
+tower = "0.5"  # For connection pooling service
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+serde_bytes = "0.11"  # For efficient byte array handling
+serde_avro_fast = "2.0"  # Fast Avro serialization (high performance)
+
+# Logging
+log = "0.4"
+
+# Performance & Types
+parking_lot = "0.12"
+smallvec = "1.13"  # Stack-allocated small vectors for shard keys
+murmur3 = "0.5"
+num_cpus = "1"
+rand = "0.9"
+regex = "1"
+# The hostname regex, which Java takes as a java.util.regex.Pattern: with
+# look-around and back-references, which the regex crate leaves out
+fancy-regex = "0.19"
+chrono = "0.4"
+thiserror = "2"
+byteorder = "1"
+num-bigint = "0.4"
+num-rational = "0.4"
+num-traits = "0.2"
+rayon = "1.10"  # Parallel processing
+arc-swap = "1.7"  # Lock-free atomic pointer swapping for HA failover
+snap = "1.1"    # Snappy compression for HTTP payloads
+uuid = { version = "1", features = ["v4"] }  # UUID generation for multi-part uploads
+# The addresses on this machine's interfaces, link-local included, as Java's
+# NetworkInterface reports them: whether an advertised address names this machine
+if-addrs = { version = "0.15", features = ["link-local"] }
+# Finds the session_id_used key in a response before decoding its info map
+memchr = "2"
+
+# Optional: SQLx for PostgreSQL wire protocol support
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "json"], optional = true }
+# Trust stores: PKCS#12 files, and SHA-1 for the integrity check of JKS ones
+p12-keystore = { version = "0.3.2", default-features = false, features = ["pbes1"] }
+ring = "0.17"
+
+# Note: jemalloc tested but made performance WORSE (see JEMALLOC_RESULTS.md)
+# System allocator is better for this workload
+
+[dev-dependencies]
+tokio-test = "0.4"
+env_logger = "0.11"
+proptest = "1.4"
+# A TLS server with generated certificates, for the trust store tests
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
