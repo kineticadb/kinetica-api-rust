@@ -304,11 +304,12 @@ Enable/disable cost-based query optimization (default: true).
 options.insert("cost_based_optimization".to_string(), "false".to_string());
 ```
 
-### distributed_joins
-Enable distributed joins for complex queries (default: false).
+### distributed_operations
+Let the query planner use distributed operations (resharding, replication) to
+service the query (default: false).
 
 ```rust
-options.insert("distributed_joins".to_string(), "true".to_string());
+options.insert("distributed_operations".to_string(), "true".to_string());
 ```
 
 ## Response Fields
@@ -412,7 +413,7 @@ assert_eq!(delete_response.count_affected, expected_count);
 4. Create appropriate indexes before large queries
 5. Use LIMIT to restrict result set size
 6. Consider `cost_based_optimization` for complex queries
-7. Enable `distributed_joins` for multi-table queries on large datasets
+7. Enable `distributed_operations` for multi-table queries on large datasets
 
 ## See Also
 

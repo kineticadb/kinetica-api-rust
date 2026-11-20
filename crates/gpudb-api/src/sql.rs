@@ -184,7 +184,6 @@ pub struct SqlHints {
 
     // Query execution hints
     distributed_operations: Option<bool>,
-    distributed_joins: Option<bool>,
     cost_based_optimization: Option<bool>,
     rule_based_optimization: Option<bool>,
     parallel_execution: Option<bool>,
@@ -285,14 +284,6 @@ impl SqlHints {
     /// When `true`, enables the use of distributed operations in servicing the given query.
     pub fn distributed_operations(mut self, value: bool) -> Self {
         self.distributed_operations = Some(value);
-        self
-    }
-
-    /// Set the `distributed_joins` hint.
-    ///
-    /// When `true`, enables the use of distributed joins in servicing the given query.
-    pub fn distributed_joins(mut self, value: bool) -> Self {
-        self.distributed_joins = Some(value);
         self
     }
 
@@ -532,9 +523,6 @@ impl SqlHints {
         if let Some(v) = self.distributed_operations {
             options.insert("distributed_operations".to_string(), v.to_string());
         }
-        if let Some(v) = self.distributed_joins {
-            options.insert("distributed_joins".to_string(), v.to_string());
-        }
         if let Some(v) = self.cost_based_optimization {
             options.insert("cost_based_optimization".to_string(), v.to_string());
         }
@@ -609,7 +597,6 @@ impl SqlHints {
             && self.ignore_existing_pk.is_none()
             && self.batch_size.is_none()
             && self.distributed_operations.is_none()
-            && self.distributed_joins.is_none()
             && self.cost_based_optimization.is_none()
             && self.rule_based_optimization.is_none()
             && self.parallel_execution.is_none()
@@ -2214,13 +2201,11 @@ mod tests {
     fn test_sql_hints_query_execution_options() {
         let hints = SqlHints::new()
             .distributed_operations(true)
-            .distributed_joins(true)
             .cost_based_optimization(false)
             .parallel_execution(false);
 
         let options = hints.to_options_map();
         assert_eq!(options.get("distributed_operations"), Some(&"true".to_string()));
-        assert_eq!(options.get("distributed_joins"), Some(&"true".to_string()));
         assert_eq!(options.get("cost_based_optimization"), Some(&"false".to_string()));
         assert_eq!(options.get("parallel_execution"), Some(&"false".to_string()));
     }
@@ -2288,7 +2273,6 @@ mod tests {
             .ignore_existing_pk(false)
             .batch_size(10000)
             .distributed_operations(true)
-            .distributed_joins(true)
             .cost_based_optimization(false)
             .rule_based_optimization(false)
             .parallel_execution(true)
@@ -2306,7 +2290,7 @@ mod tests {
             .use_approx_count_distinct(true);
 
         let options = hints.to_options_map();
-        assert_eq!(options.len(), 20);
+        assert_eq!(options.len(), 19);
         assert!(!hints.is_empty());
     }
 

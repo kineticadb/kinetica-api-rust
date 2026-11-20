@@ -48,7 +48,8 @@ use crate::record_key_builder::RecordKeyBuilder;
 use crate::worker_list::WorkerList;
 use crate::{
     AdminShowShardsRequest, GetRecordsByColumnRequest, GetRecordsByColumnResponse,
-    GetRecordsRequest, GetRecordsResponse, Kinetica, KineticaError, ShowTableRequest,
+    GetRecordsRequest, GetRecordsResponse, Kinetica, KineticaError, RawGetRecordsByColumnResponse,
+    ShowTableRequest,
 };
 use arc_swap::ArcSwap;
 use log::{debug, info, warn};
@@ -65,6 +66,40 @@ use url::Url;
 
 /// End of set marker for retrieving all records
 pub const END_OF_SET: i64 = -9999;
+
+/// The encoding a retrieval asks the server to answer in.
+///
+/// Only the undecoded retrievals take one, since the decoded ones read the
+/// Avro the server sends by default:
+/// [`RecordRetriever::get_columns_by_key_raw`] hands the payload back as it
+/// arrived, so a caller that reads Arrow or JSON itself does not pay for a
+/// decode it would only undo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecordEncoding {
+    /// Avro, in `binary_encoded_response`, which is what the rest of this
+    /// crate reads.
+    #[default]
+    Binary,
+    /// JSON, in `json_encoded_response`.
+    Json,
+    /// An Arrow IPC stream, in `binary_encoded_response`.
+    ///
+    /// `/get/records/bycolumn` answers any table this way. `/get/records`
+    /// takes it only for geometry columns, which is why the whole-record
+    /// retrievals do not offer a choice.
+    Arrow,
+}
+
+impl RecordEncoding {
+    /// Returns the name the server knows this encoding by.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Binary => "binary",
+            Self::Json => "json",
+            Self::Arrow => "arrow",
+        }
+    }
+}
 
 /// Options for the RecordRetriever.
 ///
@@ -1090,6 +1125,71 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
         expression: Option<&str>,
         offset: i64,
     ) -> Result<GetRecordsByColumnResponse, KineticaError> {
+        self.by_column(columns, key_values, expression, offset, RecordEncoding::Binary, decode_by_column)
+            .await
+    }
+
+    /// Retrieves specific columns, handing the server's response back as it
+    /// arrived rather than decoding it.
+    ///
+    /// The routing is the one [`RecordRetriever::get_columns_by_key`] does:
+    /// the key picks the rank holding its shard, and a moved shard or a lost
+    /// cluster is recovered from the same way. Only the end differs. The
+    /// payload is left where the server put it — `binary_encoded_response`
+    /// for `binary` and `arrow`, `json_encoded_response` for `json`, with
+    /// `response_schema_str` describing the first of those — so a caller that
+    /// reads Arrow or JSON itself does not pay for an Avro decode it would
+    /// only undo.
+    ///
+    /// # Arguments
+    ///
+    /// * `columns` - The requested columns (which can include expressions). May use "*" for all columns.
+    /// * `key_values` - The key values to use for the lookup, or none
+    /// * `expression` - A filter expression
+    /// * `encoding` - The encoding to ask the server to answer in
+    ///
+    /// # Returns
+    ///
+    /// The response as the server sent it.
+    pub async fn get_columns_by_key_raw(
+        &self,
+        columns: Vec<String>,
+        key_values: &[ShardKeyValue<'_>],
+        expression: Option<&str>,
+        encoding: RecordEncoding,
+    ) -> Result<RawGetRecordsByColumnResponse, KineticaError> {
+        self.get_columns_by_key_raw_with_offset(columns, key_values, expression, 0, encoding)
+            .await
+    }
+
+    /// Retrieves specific columns undecoded, starting from an offset; see
+    /// [`RecordRetriever::get_columns_by_key_raw`].
+    pub async fn get_columns_by_key_raw_with_offset(
+        &self,
+        columns: Vec<String>,
+        key_values: &[ShardKeyValue<'_>],
+        expression: Option<&str>,
+        offset: i64,
+        encoding: RecordEncoding,
+    ) -> Result<RawGetRecordsByColumnResponse, KineticaError> {
+        self.by_column(columns, key_values, expression, offset, encoding, Ok).await
+    }
+
+    /// The routing, recovery and retry the by-column retrievals share, with
+    /// `finish` making of the server's response what the caller asked for.
+    ///
+    /// `finish` runs inside the attempt, so a response that cannot be decoded
+    /// is recovered from like a worker that could not be reached: the shard
+    /// mapping is refreshed, and the retrieval retried if it had moved.
+    async fn by_column<T>(
+        &self,
+        columns: Vec<String>,
+        key_values: &[ShardKeyValue<'_>],
+        expression: Option<&str>,
+        offset: i64,
+        encoding: RecordEncoding,
+        finish: fn(RawGetRecordsByColumnResponse) -> Result<T, KineticaError>,
+    ) -> Result<T, KineticaError> {
         // Take the routing state once; see the note in get_by_key_with_offset.
         let routing = self.routing.load_full();
 
@@ -1109,7 +1209,7 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
             column_names: columns,
             offset,
             limit: END_OF_SET,
-            encoding: "binary".to_string(),
+            encoding: encoding.as_str().to_string(),
             options: retrieval_options,
         };
 
@@ -1118,7 +1218,7 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
         let current_count_cluster_switches = self.current_cluster_switch_count();
 
         let result = self
-            .try_get_columns_by_key(&routing, do_worker_lookup, key_values, &request, composite_expression.as_deref())
+            .try_by_column(&routing, do_worker_lookup, key_values, &request, composite_expression.as_deref(), finish)
             .await;
 
         match result {
@@ -1140,11 +1240,13 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
                     // matching note in get_by_key_with_offset for the risks
                     // that carries. Keep the original failure if the retry also
                     // fails.
-                    return Box::pin(self.get_columns_by_key_with_offset(
+                    return Box::pin(self.by_column(
                         request.column_names,
                         key_values,
                         expression,
                         0,
+                        encoding,
+                        finish,
                     ))
                     .await
                     .map_err(|retry_err| {
@@ -1160,15 +1262,16 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
         }
     }
 
-    /// One attempt at a `get_columns_by_key`.
-    async fn try_get_columns_by_key(
+    /// One attempt at a by-column retrieval.
+    async fn try_by_column<T>(
         &self,
         routing: &RetrieverRouting,
         do_worker_lookup: bool,
         key_values: &[ShardKeyValue<'_>],
         request: &GetRecordsByColumnRequest,
         composite_expression: Option<&str>,
-    ) -> Result<GetRecordsByColumnResponse, KineticaError> {
+        finish: fn(RawGetRecordsByColumnResponse) -> Result<T, KineticaError>,
+    ) -> Result<T, KineticaError> {
         let expression_text = composite_expression.unwrap_or("null");
         let response = if !do_worker_lookup {
             debug!("Retrieving records from rank-0 with <{expression_text}>");
@@ -1186,23 +1289,7 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
             self.update_worker_queues(true).await?;
         }
 
-        let data_type = Arc::new(Type::from_dynamic_schema(
-            &response.response_schema_str,
-            &response.binary_encoded_response,
-        )?);
-        let data = GenericRecord::transpose(
-            &response.response_schema_str,
-            &response.binary_encoded_response,
-            &data_type,
-        )?;
-        Ok(GetRecordsByColumnResponse {
-            table_name: response.table_name,
-            data_type,
-            data,
-            total_number_of_records: response.total_number_of_records,
-            has_more_records: response.has_more_records,
-            info: response.info,
-        })
+        finish(response)
     }
 
     // ==================== Helper Methods ====================
@@ -1293,6 +1380,28 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
     }
 }
 
+/// Types a by-column response by the dynamic schema it carries, which is what
+/// [`RecordRetriever::get_columns_by_key`] returns.
+fn decode_by_column(response: RawGetRecordsByColumnResponse) -> Result<GetRecordsByColumnResponse, KineticaError> {
+    let data_type = Arc::new(Type::from_dynamic_schema(
+        &response.response_schema_str,
+        &response.binary_encoded_response,
+    )?);
+    let data = GenericRecord::transpose(
+        &response.response_schema_str,
+        &response.binary_encoded_response,
+        &data_type,
+    )?;
+    Ok(GetRecordsByColumnResponse {
+        table_name: response.table_name,
+        data_type,
+        data,
+        total_number_of_records: response.total_number_of_records,
+        has_more_records: response.has_more_records,
+        info: response.info,
+    })
+}
+
 /// The time now, in milliseconds since the epoch.
 fn now_millis() -> i64 {
     SystemTime::now()
@@ -1314,6 +1423,15 @@ mod tests {
 
         assert_eq!(options.options.get("expression"), Some(&"id > 100".to_string()));
         assert_eq!(options.options.get("fast_index_lookup"), Some(&"true".to_string()));
+    }
+
+    // The names are the server's, not Rust's: a renamed variant must not
+    // quietly change what goes on the wire.
+    #[test]
+    fn an_encoding_is_named_as_the_server_knows_it() {
+        assert_eq!(RecordEncoding::default().as_str(), "binary");
+        assert_eq!(RecordEncoding::Json.as_str(), "json");
+        assert_eq!(RecordEncoding::Arrow.as_str(), "arrow");
     }
 
     #[test]
@@ -1729,6 +1847,7 @@ mod server_tests {
             let request: GetRecordsByColumnRequest =
                 serde_avro_fast::from_datum_slice(body, &crate::generated::GET_RECORDS_BY_COLUMN_REQUEST_SCHEMA).unwrap();
             assert_eq!(request.column_names, ["id"]);
+            assert_eq!(request.encoding, "binary", "the retrieval that decodes asks for Avro");
             assert_eq!(request.options.get("expression").map(String::as_str), Some("id > 2"));
             let response = RawGetRecordsByColumnResponse {
                 table_name: "t".to_string(),
@@ -1749,6 +1868,51 @@ mod server_tests {
         assert_eq!(result.data.iter().map(|r| r.get(0).cloned()).collect::<Vec<_>>(), [Some(RecordValue::Int(3)), Some(RecordValue::Int(4))]);
         assert!(result.has_more_records);
         assert_eq!(result.info.get("k").map(String::as_str), Some("v"));
+    }
+
+    // An undecoded column retrieval asks for the encoding the caller named and
+    // hands back what the server sent, which is the only way a payload this
+    // crate cannot decode -- an Arrow stream -- can be read at all.
+    #[tokio::test]
+    async fn an_undecoded_column_retrieval_asks_for_the_callers_encoding() {
+        let head = fake_server::start("127.0.0.65").await;
+        serve_table(&head, &[], false);
+        let k = connect(&head, &[]).await;
+        // The four bytes an Arrow IPC stream opens with, which is not Avro and
+        // not the dynamic schema the decoded retrieval expects.
+        let payload: &[u8] = &[0xff, 0xff, 0xff, 0xff, 0x10, 0x00, 0x00, 0x00];
+        let encodings: Arc<Mutex<Vec<String>>> = Arc::default();
+        let asked = encodings.clone();
+        let previous = head.behavior.handler.lock().clone().unwrap();
+        *head.behavior.handler.lock() = Some(Arc::new(move |path: &str, body: &[u8]| {
+            if !path.ends_with("/get/records/bycolumn") {
+                return previous(path, body);
+            }
+            let request: GetRecordsByColumnRequest =
+                serde_avro_fast::from_datum_slice(body, &crate::generated::GET_RECORDS_BY_COLUMN_REQUEST_SCHEMA).unwrap();
+            asked.lock().push(request.encoding.clone());
+            let response = RawGetRecordsByColumnResponse {
+                table_name: "t".to_string(),
+                response_schema_str: String::new(),
+                binary_encoded_response: ByteBuf::from(payload.to_vec()),
+                json_encoded_response: String::new(),
+                total_number_of_records: 2,
+                has_more_records: false,
+                info: HashMap::from([("k".to_string(), "v".to_string())]),
+            };
+            Some(Ok(encode(&crate::generated::GET_RECORDS_BY_COLUMN_RESPONSE_SCHEMA, &response)))
+        }));
+        let retriever = RecordRetriever::new(k, "t", record_type()).await.expect("retriever");
+
+        let response = retriever
+            .get_columns_by_key_raw(vec!["id".to_string()], &[], None, RecordEncoding::Arrow)
+            .await
+            .expect("the payload is passed on, not decoded");
+
+        assert_eq!(&response.binary_encoded_response[..], payload, "handed back as it arrived");
+        assert_eq!(response.total_number_of_records, 2);
+        assert_eq!(response.info.get("k").map(String::as_str), Some("v"));
+        assert_eq!(encodings.lock().as_slice(), ["arrow".to_string()]);
     }
 
     /// Answers `/admin/show/shards` with a new version each time, whose

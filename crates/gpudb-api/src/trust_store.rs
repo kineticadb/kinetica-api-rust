@@ -431,6 +431,49 @@ mod tests {
         assert!(refused.contains("the trust store holds no certificates to trust"), "{refused}");
     }
 
+    // A certificate the client does not trust fails the same way on every
+    // attempt and every cluster, so it is reported, with advice on fixing
+    // it, after one connection: not re-sent, and not a connection failure,
+    // which would fail over.
+    #[tokio::test]
+    async fn an_untrusted_certificate_is_reported_without_a_re_send() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let signed = rcgen::generate_simple_self_signed(vec!["127.0.0.174".to_string()]).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![signed.cert.der().clone()],
+                PrivateKeyDer::try_from(signed.signing_key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.174:0").await.unwrap();
+        let url = format!("https://{}/", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = connections.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counted.fetch_add(1, SeqCst);
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = acceptor.accept(stream).await;
+                });
+            }
+        });
+
+        let mut config = HttpClientConfig::from_options(&KineticaOptions::default());
+        config.max_retries = 2;
+        let err = HyperClient::with_config(&config)
+            .post_json_raw(&url, None, &RequestHeaders::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::KineticaError::Config(_)), "{err:?}");
+        assert!(err.to_string().contains("Specify a trust store"), "with advice: {err}");
+        assert_eq!(connections.load(SeqCst), 1, "not re-sent");
+    }
+
     // A store named but unreadable fails the connection's creation; one
     // without a password, or with certificates unchecked, is not used.
     #[tokio::test]

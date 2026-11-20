@@ -9539,7 +9539,13 @@ pub struct CreateTableExternalRequestOptions {
     /// rather than by name; the source column count must then equal the
     /// external table's column count plus the number of columns skipped.
     pub columns_to_skip: String,
-    /// Source data compression type.
+    /// Source data compression type: which files are checked for compression. A
+    /// checked file compressed as gzip, bzip2, zstd or lz4 is recognized by its
+    /// format and decompressed; other files are read as is, so a load can mix
+    /// compressed and uncompressed files. Compressed data that is corrupt or
+    /// truncated fails the load. Only delimited_text and json files are
+    /// decompressed; other file types accept only auto and none, and are read
+    /// as is.
     /// Server default: `auto`.
     pub compression_type: String,
     /// Name of an existing datalake(iceberg) catalog used in loading files.
@@ -12478,16 +12484,32 @@ pub struct ExecuteSqlRequestOptions {
     /// If false, disables the cost-based optimization of the given query.
     /// Server default: `false`.
     pub cost_based_optimization: String,
-    /// If true, enables the use of distributed joins in servicing the given
-    /// query. Any query requiring a distributed join will succeed, though hints
-    /// can be used in the query to change the distribution of the source data
-    /// to allow the query to succeed.
+    /// \[DEPRECATED--please use distributed_operations instead\] If true,
+    /// enables the use of distributed joins in servicing the given query. Any
+    /// query requiring a distributed join will succeed, though hints can be
+    /// used in the query to change the distribution of the source data to allow
+    /// the query to succeed.
     /// Server default: `false`.
     pub distributed_joins: String,
+    /// Controls whether distributed operations (resharding, replication) can be
+    /// used by the query planner to service the given query.
+    ///
     /// If true, enables the use of distributed operations in servicing the
-    /// given query. Any query requiring a distributed join will succeed, though
-    /// hints can be used in the query to change the distribution of the source
-    /// data to allow the query to succeed.
+    /// given query. The planner may redistribute data among the cluster's
+    /// ranks, either resharding it on the needed columns or replicating it, so
+    /// that operations on data that is not already distributed compatibly can
+    /// run. This applies to joins between tables that are not sharded on their
+    /// join columns, or that mix sharded and replicated tables, and to set
+    /// operations (UNION, INTERSECT, EXCEPT) over inputs with differing
+    /// distributions. It also lets the planner shard intermediate results, such
+    /// as aggregations on their grouping columns, to reduce the data that later
+    /// steps of the query must move.
+    ///
+    /// If false, no data is redistributed, and any query requiring a
+    /// distributed join or set operation will fail; hints can be used in the
+    /// query to change the distribution of the source data to allow the query
+    /// to succeed. This option has no effect when the data being queried is in
+    /// a single shard.
     /// Server default: `false`.
     pub distributed_operations: String,
     /// Specifies the record collision error-suppression policy for inserting
@@ -16793,7 +16815,13 @@ pub struct InsertRecordsFromFilesRequestOptions {
     /// source column count must then equal the target table's column count plus
     /// the number of columns skipped.
     pub columns_to_skip: String,
-    /// Source data compression type.
+    /// Source data compression type: which files are checked for compression. A
+    /// checked file compressed as gzip, bzip2, zstd or lz4 is recognized by its
+    /// format and decompressed; other files are read as is, so a load can mix
+    /// compressed and uncompressed files. Compressed data that is corrupt or
+    /// truncated fails the load. Only delimited_text and json files are
+    /// decompressed; other file types accept only auto and none, and are read
+    /// as is.
     /// Server default: `auto`.
     pub compression_type: String,
     /// If set to true, creates the table specified by `table_name` if it does
@@ -17570,7 +17598,12 @@ pub struct InsertRecordsFromPayloadRequestOptions {
     /// source column count must then equal the target table's column count plus
     /// the number of columns skipped.
     pub columns_to_skip: String,
-    /// Payload compression type.
+    /// Payload compression type. Unless it is none, a payload compressed as
+    /// gzip, bzip2, zstd or lz4 is recognized by its format and decompressed;
+    /// other payloads are read as is. A compressed payload that is corrupt or
+    /// truncated fails the load. Only delimited_text and json payloads are
+    /// decompressed; other file types accept only auto and none, and are read
+    /// as is.
     /// Server default: `auto`.
     pub compression_type: String,
     /// If set to true, creates the table specified by `table_name` if it does
@@ -25712,12 +25745,15 @@ pub mod constants {
             /// Estimate (via t-digest) of the given percentile of the column(s)
             /// (percentile(50.0) will be an approximation of the median). Add a
             /// second, comma-separated value to calculate percentile
-            /// resolution, e.g., 'percentile(75,150)'.
+            /// resolution, e.g., 'percentile(75,150)'. The resolution must be
+            /// between 10 and 10000; the default is 100.
             pub const PERCENTILE: &str = "percentile";
             /// Estimate (via t-digest) of the percentile rank of the given
             /// value in the column(s) (if the given value is the median of the
             /// column(s), percentile_rank(\<median>) will return approximately
-            /// 50.0).
+            /// 50.0). Add a second, comma-separated value to calculate
+            /// percentile resolution, e.g., 'percentile_rank(1234.56,150)'. The
+            /// resolution must be between 10 and 10000; the default is 100.
             pub const PERCENTILE_RANK: &str = "percentile_rank";
         }
         /// Constants for `options`.
@@ -26538,6 +26574,10 @@ pub mod constants {
             /// Capture metrics for any query exceeding this duration in
             /// seconds.
             pub const TELM_FORCE_METRICS_DURATION: &str = "telm_force_metrics_duration";
+            /// Maximum number of telemetry meters a single query may hold per
+            /// rank; once reached, the query's further workers run unmetered,
+            /// so its metrics are incomplete. Use 0 for no limit.
+            pub const TELM_MAX_METERS_PER_QUERY: &str = "telm_max_meters_per_query";
             /// Idle connection timeout in seconds.
             pub const POSTGRES_PROXY_IDLE_CONNECTION_TIMEOUT: &str =
                 "postgres_proxy_idle_connection_timeout";
@@ -28216,16 +28256,27 @@ pub mod constants {
             /// source column count must then equal the external table's column
             /// count plus the number of columns skipped.
             pub const COLUMNS_TO_SKIP: &str = "columns_to_skip";
-            /// Source data compression type.
+            /// Source data compression type: which files are checked for
+            /// compression. A checked file compressed as gzip, bzip2, zstd or
+            /// lz4 is recognized by its format and decompressed; other files
+            /// are read as is, so a load can mix compressed and uncompressed
+            /// files. Compressed data that is corrupt or truncated fails the
+            /// load. Only delimited_text and json files are decompressed; other
+            /// file types accept only auto and none, and are read as is.
             pub const COMPRESSION_TYPE: &str = "compression_type";
-            /// No compression.
+            /// No decompression: files are read as is.
             pub const NONE: &str = "none";
-            /// Auto detect compression type.
+            /// Decompress files whose names end in .gz, .bz2, .zst or .lz4.
             pub const AUTO: &str = "auto";
-            /// gzip file compression.
+            /// Check every file, whatever its name. Named for gzip, but any
+            /// supported format is decompressed.
             pub const GZIP: &str = "gzip";
-            /// bzip2 file compression.
+            /// Check every file, whatever its name. Named for bzip2, but any
+            /// supported format is decompressed.
             pub const BZIP2: &str = "bzip2";
+            /// Check every file, whatever its name. Named for zstd, but any
+            /// supported format is decompressed.
+            pub const ZSTD: &str = "zstd";
             /// Name of an existing datalake(iceberg) catalog used in loading
             /// files.
             pub const DATALAKE_CATALOG: &str = "datalake_catalog";
@@ -29279,15 +29330,6 @@ pub mod constants {
         }
     }
 
-    /// Constants for the fields of the `/execute/proc` response.
-    pub mod execute_proc_response {
-        /// Constants for `info`.
-        pub mod info {
-            /// \<DEVELOPER>
-            pub const DEFERRED_TABLES: &str = "deferred_tables";
-        }
-    }
-
     /// Constants for the fields of the `/execute/sql` request.
     pub mod execute_sql_request {
         /// Constants for `encoding`.
@@ -29305,15 +29347,33 @@ pub mod constants {
             pub const COST_BASED_OPTIMIZATION: &str = "cost_based_optimization";
             pub const TRUE: &str = "true";
             pub const FALSE: &str = "false";
-            /// If true, enables the use of distributed joins in servicing the
+            /// \[DEPRECATED--please use distributed_operations instead\] If
+            /// true, enables the use of distributed joins in servicing the
             /// given query. Any query requiring a distributed join will
             /// succeed, though hints can be used in the query to change the
             /// distribution of the source data to allow the query to succeed.
             pub const DISTRIBUTED_JOINS: &str = "distributed_joins";
+            /// Controls whether distributed operations (resharding,
+            /// replication) can be used by the query planner to service the
+            /// given query.
+            ///
             /// If true, enables the use of distributed operations in servicing
-            /// the given query. Any query requiring a distributed join will
-            /// succeed, though hints can be used in the query to change the
-            /// distribution of the source data to allow the query to succeed.
+            /// the given query. The planner may redistribute data among the
+            /// cluster's ranks, either resharding it on the needed columns or
+            /// replicating it, so that operations on data that is not already
+            /// distributed compatibly can run. This applies to joins between
+            /// tables that are not sharded on their join columns, or that mix
+            /// sharded and replicated tables, and to set operations (UNION,
+            /// INTERSECT, EXCEPT) over inputs with differing distributions. It
+            /// also lets the planner shard intermediate results, such as
+            /// aggregations on their grouping columns, to reduce the data that
+            /// later steps of the query must move.
+            ///
+            /// If false, no data is redistributed, and any query requiring a
+            /// distributed join or set operation will fail; hints can be used
+            /// in the query to change the distribution of the source data to
+            /// allow the query to succeed. This option has no effect when the
+            /// data being queried is in a single shard.
             pub const DISTRIBUTED_OPERATIONS: &str = "distributed_operations";
             /// Specifies the record collision error-suppression policy for
             /// inserting into or updating a table with a primary key, only used
@@ -30974,16 +31034,27 @@ pub mod constants {
             /// position; the source column count must then equal the target
             /// table's column count plus the number of columns skipped.
             pub const COLUMNS_TO_SKIP: &str = "columns_to_skip";
-            /// Source data compression type.
+            /// Source data compression type: which files are checked for
+            /// compression. A checked file compressed as gzip, bzip2, zstd or
+            /// lz4 is recognized by its format and decompressed; other files
+            /// are read as is, so a load can mix compressed and uncompressed
+            /// files. Compressed data that is corrupt or truncated fails the
+            /// load. Only delimited_text and json files are decompressed; other
+            /// file types accept only auto and none, and are read as is.
             pub const COMPRESSION_TYPE: &str = "compression_type";
-            /// No compression.
+            /// No decompression: files are read as is.
             pub const NONE: &str = "none";
-            /// Auto detect compression type.
+            /// Decompress files whose names end in .gz, .bz2, .zst or .lz4.
             pub const AUTO: &str = "auto";
-            /// gzip file compression.
+            /// Check every file, whatever its name. Named for gzip, but any
+            /// supported format is decompressed.
             pub const GZIP: &str = "gzip";
-            /// bzip2 file compression.
+            /// Check every file, whatever its name. Named for bzip2, but any
+            /// supported format is decompressed.
             pub const BZIP2: &str = "bzip2";
+            /// Check every file, whatever its name. Named for zstd, but any
+            /// supported format is decompressed.
+            pub const ZSTD: &str = "zstd";
             /// If set to true, creates the table specified by `table_name` if
             /// it does not already exist. If set to false, returns an error if
             /// the table does not already exist. Not supported with
@@ -31529,16 +31600,26 @@ pub mod constants {
             /// position; the source column count must then equal the target
             /// table's column count plus the number of columns skipped.
             pub const COLUMNS_TO_SKIP: &str = "columns_to_skip";
-            /// Payload compression type.
+            /// Payload compression type. Unless it is none, a payload
+            /// compressed as gzip, bzip2, zstd or lz4 is recognized by its
+            /// format and decompressed; other payloads are read as is. A
+            /// compressed payload that is corrupt or truncated fails the load.
+            /// Only delimited_text and json payloads are decompressed; other
+            /// file types accept only auto and none, and are read as is.
             pub const COMPRESSION_TYPE: &str = "compression_type";
-            /// Uncompressed.
+            /// Uncompressed: the payload is read as is.
             pub const NONE: &str = "none";
-            /// Default. Auto detect compression type.
+            /// Default. Decompress the payload if it is compressed.
             pub const AUTO: &str = "auto";
-            /// gzip file compression.
+            /// Same as auto. Named for gzip, but any supported format is
+            /// decompressed.
             pub const GZIP: &str = "gzip";
-            /// bzip2 file compression.
+            /// Same as auto. Named for bzip2, but any supported format is
+            /// decompressed.
             pub const BZIP2: &str = "bzip2";
+            /// Same as auto. Named for zstd, but any supported format is
+            /// decompressed.
+            pub const ZSTD: &str = "zstd";
             /// If set to true, creates the table specified by `table_name` if
             /// it does not already exist. If set to false, returns an error if
             /// the table does not already exist. Not supported with
@@ -33104,6 +33185,11 @@ pub mod constants {
             pub const UDF: &str = "udf";
             /// Cast Function - 16.
             pub const CAST: &str = "cast";
+            /// Never returns NULL, even for NULL arguments - 32.
+            pub const NEVER_NULL: &str = "never_null";
+            /// Non-deterministic Function whose value varies per row, not only
+            /// per query - 64.
+            pub const VARIES_PER_ROW: &str = "varies_per_row";
             /// Non-deterministic Function - 256.
             pub const NONDETERMINISTIC: &str = "nondeterministic";
         }

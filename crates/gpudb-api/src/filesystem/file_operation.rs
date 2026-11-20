@@ -959,7 +959,7 @@ mod local_file_tests {
     // ---- glob detection ----
 
     #[test]
-    fn glob_characters_are_recognised() {
+    fn glob_characters_are_recognized() {
         for s in ["*.csv", "a?.csv", "{a,b}.csv", "[ab].csv", "a\\b.csv"] {
             assert!(is_glob_pattern(s), "{s} should be a pattern");
         }

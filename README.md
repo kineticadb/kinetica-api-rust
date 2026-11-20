@@ -68,27 +68,27 @@ The API needs Rust 1.88 or later, and a Tokio runtime. Add it to your
 
 ```toml
 [dependencies]
-gpudb-api = "7.2.3-0"
+gpudb-api = "~7.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
 For SQLx support, enable the `sqlx` feature:
 
 ```toml
-gpudb-api = { version = "7.2.3-0", features = ["sqlx"] }
+gpudb-api = { version = "~7.2", features = ["sqlx"] }
 ```
 
 ### Versions
 
-The crate's version is the Kinetica version it implements, `MAJOR.MINOR.REVISION`,
-with this client's own release of it after a `-`: `7.2.3-0` is release `0` of the
-client for Kinetica 7.2.3. Cargo takes a version with a `-` suffix only when
-asked for one, so depend on the crate as `"7.2.3-0"` (any release for 7.2.3) or
-`"=7.2.3-N"` (that release only); a plain `"7.2.3"` matches none of them.
+The crate's version is SemVer, `MAJOR.MINOR.PATCH`: `MAJOR.MINOR` is the
+Kinetica version it implements, and `PATCH` counts this client's own releases
+for it, so `7.2.3`, `7.2.4` and so on are all clients for Kinetica 7.2. Depend
+on the crate as `"~7.2"` to take every release for Kinetica 7.2 and none for a
+later Kinetica version; Cargo's default for a plain `"7.2.3"` would also accept
+`7.3` and later.
 
-`Kinetica::api_version()` gives the version with the time of the build
-(`7.2.3.0-20261010120000`), and the `User-Agent` header carries it without
-(`kinetica-api-rust/7.2.3.0`).
+`Kinetica::api_version()` gives the version (`7.2.3`), and the `User-Agent`
+header carries it (`kinetica-api-rust/7.2.3`).
 
 ### Building for Other Platforms
 
@@ -300,7 +300,7 @@ opts.update_on_existing_pk = "true".to_string();   // only this key is sent
 ```
 
 Options are deliberately *not* filled in with their defaults: a server older
-than the API rejects a key it does not recognise (`Parameter map key: '...' is
+than the API rejects a key it does not recognize (`Parameter map key: '...' is
 not a valid parameter`).
 
 ### Binary Fields
@@ -1223,7 +1223,7 @@ crosses components, `[a-z]` / `[!a-z]` are character classes, `{csv,json}` is a
 group of alternatives, and `\` escapes the next character. A name containing
 any of `* ? [ { \` is treated as a pattern.
 
-### Upload and Download Behaviour
+### Upload and Download Behavior
 
 Note these, including where they carry a risk:
 
@@ -1493,11 +1493,18 @@ A request is first retried on the same server, at once and up to `max_retries`
 times (default 5), when it cannot be sent or the server answers 502 or 503. It
 then fails over to the next cluster when the server cannot serve it (it is
 unreachable, exiting, offline or returns a gateway error), but not for an
-ordinary API error or an authentication failure. Once a failover has moved the
-connection off the primary cluster, the primary is checked every
-`failback_polling_interval` seconds (default 5), and the connection switches
-back to it when it is running, its HA queues have drained and it answers a
-query.
+ordinary API error or an authentication failure.
+
+A cluster that has just come back online answers for a few seconds that a rank's
+HA client is not ready. A request it refuses this way is sent to the same server
+again, waiting 1 second before the first re-send and twice as long before each
+one after it, at most 8 seconds, up to `max_retries` times, and then fails over.
+A `BulkInserter` batch does the same within the inserter's own `max_retries`.
+
+Once a failover has moved the connection off the primary cluster, the primary is
+checked every `failback_polling_interval` seconds (default 5), and the connection
+switches back to it when it is running, its HA queues have drained and it
+answers a query.
 
 ### Snappy Compression
 

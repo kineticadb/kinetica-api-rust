@@ -193,7 +193,7 @@ fn sanitize_user_agent_token(value: &str) -> String {
 /// compiler and the platform:
 ///
 /// ```text
-/// MyApp/1.0 kinetica-api-rust/7.2.3.0 (Rust/1.88.0; Linux/6.8.0-146-generic; amd64)
+/// MyApp/1.0 kinetica-api-rust/7.2.3 (Rust/1.88.0; Linux/6.8.0-146-generic; amd64)
 /// ```
 ///
 /// The client program's name and version, if given, come first.
@@ -1252,6 +1252,41 @@ const DB_QP_DOWN_ERROR_MESSAGE: &str = "Query planner is not running";
 /// exit.
 const DB_EOF_FROM_SERVER_ERROR_MESSAGE: &str = "Unexpected end of file from server";
 
+/// Server messages saying a rank is still rebuilding its HA client after its
+/// cluster came back online. The rank refuses the request before handling
+/// it, so nothing was stored and the request can be sent again; the state
+/// clears within seconds. `Draining HA queue` shares their prefix but is a
+/// backlog the cluster must replay first, so it fails over instead.
+const DB_HA_PRODUCER_NOT_READY_MESSAGE: &str = "Unavailable: Producer not available";
+const DB_HA_CONSUMER_NOT_READY_MESSAGE: &str = "Unavailable: Consumer not created";
+
+/// The wait before the first re-send of a request a rank was not ready for;
+/// each later re-send waits twice as long, up to
+/// [`RANK_NOT_READY_MAX_WAIT`].
+const RANK_NOT_READY_FIRST_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// The longest wait before a re-send of a request a rank was not ready for.
+const RANK_NOT_READY_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Whether a server message says the rank's HA client is not ready yet.
+pub(crate) fn is_rank_not_ready_message(message: &str) -> bool {
+    message.contains(DB_HA_PRODUCER_NOT_READY_MESSAGE) || message.contains(DB_HA_CONSUMER_NOT_READY_MESSAGE)
+}
+
+/// Whether `error` is a rank refusing a request because its HA client is not
+/// ready yet: an exit carrying the server's message, which is re-sent to the
+/// same server after [`rank_not_ready_wait`] while the request's retries
+/// last, and fails over after that.
+pub(crate) fn is_rank_not_ready(error: &KineticaError) -> bool {
+    matches!(error, KineticaError::Exit(message) if is_rank_not_ready_message(message))
+}
+
+/// The wait before re-send number `resend` (from 0) of a request a rank was
+/// not ready for: 1 s, then twice as long each time, at most 8 s.
+pub(crate) fn rank_not_ready_wait(resend: usize) -> std::time::Duration {
+    let doublings = u32::try_from(resend).unwrap_or(u32::MAX).min(3);
+    (RANK_NOT_READY_FIRST_WAIT * 2u32.pow(doublings)).min(RANK_NOT_READY_MAX_WAIT)
+}
+
 /// Interprets a response, returning its wrapper or the error it amounts to.
 ///
 /// The error kind decides what happens next. [`KineticaError::Exit`] and
@@ -1262,9 +1297,12 @@ const DB_EOF_FROM_SERVER_ERROR_MESSAGE: &str = "Unexpected end of file from serv
 /// - A text body (an HTML page from a proxy, say) is an exit on 500, 502, 503
 ///   or 504, and a submit failure otherwise.
 /// - An empty body is an exit.
-/// - An Avro `ERROR` is an exit if the status is 500, 502, 503 or 504, or if
-///   the message says the server is exiting, offline, shutting down or
-///   draining; any other `ERROR` is an API error.
+/// - An Avro `ERROR` saying the rank's HA client is not ready is an exit
+///   carrying the server's message, whatever the status, which
+///   [`is_rank_not_ready`] recognizes.
+/// - Any other Avro `ERROR` is an exit if the status is 500, 502, 503 or 504,
+///   or if the message says the server is exiting, offline, shutting down or
+///   draining; otherwise it is an API error.
 /// - A body that is not a valid response is a submit failure.
 fn interpret_response(url: &str, resp: &crate::hyper_client::RawResponse) -> Result<WrapperResponse, KineticaError> {
     let (status, reason) = (resp.status, resp.reason.as_str());
@@ -1296,6 +1334,12 @@ fn interpret_response(url: &str, resp: &crate::hyper_client::RawResponse) -> Res
     let wrapper: WrapperResponse = serde_avro_fast::from_datum_slice(&resp.body, wrapper_schema())
         .map_err(|e| KineticaError::Http(format!("Wrapper decode failed: {e}")))?;
     let message = wrapper.message.as_str();
+
+    // Decided by the message before the status
+    if wrapper.status == "ERROR" && is_rank_not_ready_message(message) {
+        debug!("Returning a rank-not-ready exit error from {url}; response_code: {status}; message: {message}");
+        return Err(KineticaError::Exit(message.to_string()));
+    }
 
     if status == 400 {
         if message.contains(DB_SHUTTING_DOWN_ERROR_MESSAGE) {
@@ -1799,11 +1843,11 @@ impl Kinetica {
         self.cluster_info().map(|c| c.system_properties().clone()).unwrap_or_default()
     }
 
-    /// This client's version and build number: the Kinetica API version
-    /// (MAJOR.MINOR.REVISION.ABI, the crate version `7.2.3-0` as `7.2.3.0`),
-    /// then the time of the build, `7.2.3.0-20261010120000`.
+    /// This client's version, the crate's SemVer version (`7.2.3`):
+    /// `MAJOR.MINOR` is the Kinetica version it implements, and `PATCH`
+    /// counts the client's own releases of it.
     pub fn api_version() -> &'static str {
-        env!("GPUDB_API_VERSION_FULL")
+        env!("GPUDB_API_VERSION")
     }
 
     /// The additional HTTP headers sent with each request, the `User-Agent`
@@ -1925,7 +1969,13 @@ impl Kinetica {
     /// Builds the client and processes its URLs, without the connectivity
     /// check that [`Kinetica::new`] then runs.
     pub(crate) async fn connect(urls: Vec<String>, options: KineticaOptions) -> Result<Self, KineticaError> {
-        debug!("Initializing Kinetica client with {} URL(s)", urls.len());
+        debug!(
+            // The version with the build number as SemVer build metadata
+            "Initializing Kinetica client {}+{} with {} URL(s)",
+            env!("GPUDB_API_VERSION"),
+            env!("GPUDB_API_BUILD_NUMBER"),
+            urls.len()
+        );
         debug!("URLs: {urls:?}");
 
         if urls.is_empty() {
@@ -2307,10 +2357,48 @@ impl Kinetica {
                     // Try every server-advertised address for the head rank; if
                     // none answers, use the given URL head-node-only.
                     let server_is_local = resolution::is_local_address(url.host_str().unwrap_or("")).await;
-                    let Some(reachable_head_node_url) = self
+                    let reachable = self
                         .resolve_reachable_head_node_url(&system_properties, &cluster_head_node_url, server_is_local)
-                        .await
-                    else {
+                        .await;
+                    let host_manager_url = self.build_host_manager_url(
+                        &url,
+                        resolution::is_httpd_enabled(&system_properties),
+                        &system_properties,
+                    )?;
+
+                    if let Some(reachable_head_node_url) = reachable {
+                        // A head rank answered, so the cluster's advertised
+                        // address space is reachable and multi-head is viable.
+                        // That is all the probe establishes: it does not establish
+                        // that what answered is this cluster. A server advertising
+                        // an address that resolves elsewhere from here (loopback, a
+                        // container bridge present on every host, a name that
+                        // exists in two namespaces) sends the probe to a different
+                        // Kinetica, which answers exactly as the right one would.
+                        //
+                        // So the connection stays on the address the caller gave.
+                        // It is the only one with an authority behind it: the
+                        // caller asserted it, and the cluster's own properties
+                        // arrived through it. Every other candidate is the server's
+                        // self-report, which is the thing in question.
+                        if reachable_head_node_url != cluster_head_node_url {
+                            debug!(
+                                "Head rank did not answer at its preferred address <{cluster_head_node_url}> but did \
+                                 at <{reachable_head_node_url}>; multi-head stays enabled and the connection continues \
+                                 through the user-given URL <{url}>"
+                            );
+                        }
+
+                        cluster_info.set_active_head_node_url(url.clone());
+                        cluster_info.set_host_manager_url(host_manager_url);
+
+                        debug!(
+                            "Verified connectivity with user-given URL {url} at server-known URL {}; adding index {} \
+                             to user-given processed cluster list",
+                            cluster_info.active_head_node_url(),
+                            self.host_addresses.write().len()
+                        );
+                    } else {
                         // Recorded, not announced, until a connection is
                         // attempted to this cluster.
                         debug!(
@@ -2318,53 +2406,24 @@ impl Kinetica {
                              the user-given URL but not with its server-known URL <{cluster_head_node_url}>"
                         );
 
-                        // Record the lost capability against THIS cluster only,
-                        // keyed on the URL that does work, and carry on.
-                        let mut degraded = ClusterAddressInfo::with_host_manager_port(url, self.host_manager_port)?;
-                        degraded.set_ha_status(ha_status);
-                        degraded.set_multi_head_available(false);
-
-                        cluster_indices_of_user_given_urls.push(self.host_addresses.write().len());
-                        self.host_addresses.write().push(degraded);
-                        continue;
-                    };
-
-                    // A head rank answered, so the cluster's advertised
-                    // address space is reachable and multi-head is viable.
-                    // That is all the probe establishes: it does not establish
-                    // that what answered is this cluster. A server advertising
-                    // an address that resolves elsewhere from here (loopback, a
-                    // container bridge present on every host, a name that
-                    // exists in two namespaces) sends the probe to a different
-                    // Kinetica, which answers exactly as the right one would.
-                    //
-                    // So the connection stays on the address the caller gave.
-                    // It is the only one with an authority behind it: the
-                    // caller asserted it, and the cluster's own properties
-                    // arrived through it. Every other candidate is the server's
-                    // self-report, which is the thing in question.
-                    if reachable_head_node_url != cluster_head_node_url {
-                        debug!(
-                            "Head rank did not answer at its preferred address <{cluster_head_node_url}> but did \
-                             at <{reachable_head_node_url}>; multi-head stays enabled and the connection continues \
-                             through the user-given URL <{url}>"
-                        );
+                        // Demote only multi-head. The record is still this
+                        // cluster's own, built from its properties: it keeps
+                        // every address advertised for the head rank, those
+                        // that did not answer included, so that a ring naming
+                        // the cluster by any of them finds this record rather
+                        // than adding another. Its ring peers are queued below,
+                        // as for any cluster. Only the head moves, to the URL
+                        // that works, and the cluster is left with no worker
+                        // URLs and no multi-head.
+                        let mut host_names = cluster_info.host_names().clone();
+                        if let Some(host) = url.host_str() {
+                            host_names.insert(host.to_string());
+                        }
+                        cluster_info.set_active_head_node_url(url.clone());
+                        cluster_info.set_host_manager_url(host_manager_url);
+                        cluster_info.set_host_names(host_names);
+                        cluster_info.set_multi_head_snapshot(Arc::new(MultiHeadSnapshot::new(Vec::new(), false)));
                     }
-
-                    let host_manager_url = self.build_host_manager_url(
-                        &url,
-                        resolution::is_httpd_enabled(&system_properties),
-                        &system_properties,
-                    )?;
-                    cluster_info.set_active_head_node_url(url.clone());
-                    cluster_info.set_host_manager_url(host_manager_url);
-
-                    debug!(
-                        "Verified connectivity with user-given URL {url} at server-known URL {}; adding index {} \
-                         to user-given processed cluster list",
-                        cluster_info.active_head_node_url(),
-                        self.host_addresses.write().len()
-                    );
                 }
 
                 cluster_indices_of_user_given_urls.push(self.host_addresses.write().len());
@@ -2373,25 +2432,8 @@ impl Kinetica {
             debug!("Added URL {url} -> cluster {cluster_info}");
             self.host_addresses.write().push(cluster_info);
 
-            // Add the HA ring head nodes in the properties to the queue, if not
-            // processed already; this could fail on a hostname regex mismatch
-            let ha_ring_head_node_urls =
-                resolution::ha_ring_head_node_urls(&system_properties, self.hostname_regex.as_ref())?;
-            debug!("Got HA ring head node URLs: {}", url_list(&ha_ring_head_node_urls));
-            for ha_url in ha_ring_head_node_urls {
-                let known = Self::index_of_cluster_containing_node(
-                    &self.host_addresses.read(),
-                    ha_url.host_str().unwrap_or(""),
-                );
-                if known.is_none() {
-                    if !url_queue.contains(&ha_url) {
-                        debug!("HA ring head node URL {ha_url} not found in known clusters; adding to queue to process");
-                        url_queue.push_back(ha_url);
-                    }
-                } else {
-                    debug!("HA ring head node URL {ha_url} found in known clusters; skipping");
-                }
-            }
+            // This could fail on a hostname regex mismatch
+            self.queue_ha_ring_head_nodes(&system_properties, &mut url_queue)?;
         }
 
         // Check that we have got at least one working URL
@@ -2474,6 +2516,31 @@ impl Kinetica {
             }
         }
 
+        Ok(())
+    }
+
+    /// Appends the HA ring head nodes from the given system properties map
+	/// to the given queue.
+    ///
+    /// Fails on a URL that does not match the hostname regex.
+    fn queue_ha_ring_head_nodes(
+        &self,
+        system_properties: &HashMap<String, String>,
+        url_queue: &mut VecDeque<Url>,
+    ) -> Result<(), KineticaError> {
+        let ha_ring_head_node_urls =
+            resolution::ha_ring_head_node_urls(system_properties, self.hostname_regex.as_ref())?;
+        debug!("Got HA ring head node URLs: {}", url_list(&ha_ring_head_node_urls));
+        for ha_url in ha_ring_head_node_urls {
+            let known =
+                Self::index_of_cluster_containing_node(&self.host_addresses.read(), ha_url.host_str().unwrap_or(""));
+            if known.is_some() {
+                debug!("HA ring head node URL {ha_url} found in known clusters; skipping");
+            } else if !url_queue.contains(&ha_url) {
+                debug!("HA ring head node URL {ha_url} not found in known clusters; adding to queue to process");
+                url_queue.push_back(ha_url);
+            }
+        }
         Ok(())
     }
 
@@ -3682,6 +3749,8 @@ impl Kinetica {
             KineticaError::Connection("No URL available".to_string())
         })?;
         let original_url = url.clone();
+        // Number of re-sends when a rank was not ready; fail-over resets it.
+        let mut not_ready_resends = 0;
 
         loop {
             // Capture the current cluster switch count before attempting the request
@@ -3700,6 +3769,21 @@ impl Kinetica {
                     return Err(KineticaError::Api(msg));
                 }
 
+                // A rank rebuilding its HA client refused the request before
+                // handling it: wait, then send it to the same server again,
+                // up to max_retries times, before failing over below.
+                Err(error) if is_rank_not_ready(&error) && not_ready_resends < self.max_retries() => {
+                    let wait = rank_not_ready_wait(not_ready_resends);
+                    not_ready_resends += 1;
+                    warn!(
+                        "Endpoint {endpoint} at {url} is not ready: {}; re-sending in {}s (re-send {not_ready_resends} of {})",
+                        error.message(),
+                        wait.as_secs(),
+                        self.max_retries()
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+
                 // A server exiting or a request that could not be sent, or one
                 // that failed on the way: fail over. Note what that implies for
                 // writes: an Http error can come after the server has already
@@ -3716,6 +3800,7 @@ impl Kinetica {
                         Ok(new_url) => {
                             debug!("Switched to {new_url}");
                             url = new_url;
+                            not_ready_resends = 0;
                         }
                         Err(KineticaError::HaUnavailable(ha_msg) | KineticaError::FailoverDisabled(ha_msg)) => {
                             return Err(failover_exhausted(&error, &ha_msg));
@@ -4258,6 +4343,30 @@ mod response_classification_tests {
         assert!(matches!(err, KineticaError::Exit(ref m) if m == "Draining HA message queue"), "{err:?}");
     }
 
+    // A rank whose HA client is not ready is an exit carrying the server's
+    // message, whatever the status, and is recognized for a re-send; a
+    // draining HA queue, which shares the prefix, is not.
+    #[test]
+    fn a_rank_not_ready_is_an_exit_whatever_the_status() {
+        for message in ["[HA] Unavailable: Producer not available", "[HA] Unavailable: Consumer not created"] {
+            for status in [200, 400, 500] {
+                let err = classify(status, OCTET, avro("ERROR", message)).unwrap_err();
+                assert!(matches!(err, KineticaError::Exit(ref m) if m == message), "{status}: {err:?}");
+                assert!(is_rank_not_ready(&err), "{status}: {err:?}");
+            }
+        }
+        let draining = classify(400, OCTET, avro("ERROR", "[HA] Unavailable: Draining HA queue")).unwrap_err();
+        assert!(!is_rank_not_ready(&draining), "{draining:?}");
+        assert!(!is_rank_not_ready(&KineticaError::Api("[HA] Unavailable: Producer not available".into())));
+    }
+
+    #[test]
+    fn a_rank_not_ready_waits_one_second_doubling_to_eight() {
+        let waits: Vec<u64> = (0..7).map(|resend| rank_not_ready_wait(resend).as_secs()).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 8, 8, 8]);
+        assert_eq!(rank_not_ready_wait(usize::MAX).as_secs(), 8);
+    }
+
     #[test]
     fn a_text_body_is_an_exit_on_server_errors_and_a_submit_failure_otherwise() {
         let html = Bytes::from_static(b"<html>Bad Gateway</html>");
@@ -4790,8 +4899,13 @@ mod header_tests {
         assert!(connected);
         let info: Vec<_> = records.iter().filter(|(level, _)| *level == log::Level::Info).collect();
         assert!(info.is_empty(), "{info:?}");
+        let initializing = format!(
+            "Initializing Kinetica client {}+{} with 1 URL(s)",
+            env!("GPUDB_API_VERSION"),
+            env!("GPUDB_API_BUILD_NUMBER")
+        );
         assert!(
-            records.contains(&(log::Level::Debug, "Initializing Kinetica client with 1 URL(s)".to_string())),
+            records.contains(&(log::Level::Debug, initializing)),
             "the construction's records are the ones seen"
         );
     }
@@ -4847,15 +4961,12 @@ mod header_tests {
         assert_eq!(k.primary_url(), Some(server.url.clone()), "a lone cluster is the primary");
         assert_eq!(k.primary_hostname(), "127.0.0.95");
         assert_eq!(k.system_properties().get("conf.number_of_hosts").map(String::as_str), Some("1"));
-        // The version, then the time of the build
-        let (version, build) = Kinetica::api_version().split_once('-').expect("a build number");
-        // The crate version, MAJOR.MINOR.REVISION-ABI, as MAJOR.MINOR.REVISION.ABI
-        let crate_version = concat!(
-            env!("CARGO_PKG_VERSION_MAJOR"), ".", env!("CARGO_PKG_VERSION_MINOR"), ".",
-            env!("CARGO_PKG_VERSION_PATCH"), ".", env!("CARGO_PKG_VERSION_PRE")
-        );
-        assert_eq!(version, crate_version);
-        assert_eq!(env!("GPUDB_API_VERSION"), crate_version, "the User-Agent's version");
+        // The crate's SemVer version, with no build number, and the same in
+        // the User-Agent; the build number is the time of the build
+        assert_eq!(Kinetica::api_version(), env!("CARGO_PKG_VERSION"));
+        assert!(Kinetica::api_version().split('.').count() == 3, "MAJOR.MINOR.PATCH: {}", Kinetica::api_version());
+        assert_eq!(env!("GPUDB_API_VERSION"), env!("CARGO_PKG_VERSION"), "the User-Agent's version");
+        let build = env!("GPUDB_API_BUILD_NUMBER");
         assert!(build.len() == 14 && build.bytes().all(|b| b.is_ascii_digit()), "%Y%m%d%H%M%S: {build}");
 
         let headers = k.http_headers();
@@ -4939,6 +5050,64 @@ mod connection_tests {
         let mut options = KineticaOptions::default();
         options.set_server_connection_timeout(500).set_max_retries(0);
         options
+    }
+
+    /// A client of one cluster on `host`, with `max_retries` re-sends.
+    async fn one_cluster(host: &str, max_retries: usize) -> (fake_server::FakeServer, Kinetica) {
+        let server = fake_server::start(host).await;
+        *server.behavior.properties.lock() = cluster_properties(&address(&server), &[]);
+        let mut options = options();
+        options.set_max_retries(max_retries);
+        let k = Kinetica::new(vec![server.url.to_string()], options).await.expect("client");
+        (server, k)
+    }
+
+    /// Answers `/show/system/status` with the error `message` the next
+    /// `refusals` times, and as a running system after that.
+    fn refusing_status(server: &fake_server::FakeServer, message: &'static str, refusals: usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let left = Arc::new(AtomicUsize::new(refusals));
+        *server.behavior.handler.lock() = Some(Arc::new(move |path: &str, _: &[u8]| {
+            let refuse = path.ends_with("/show/system/status") && left.fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1)).is_ok();
+            refuse.then(|| Err(message.to_string()))
+        }));
+    }
+
+    // A rank whose HA client is not ready is waited out on the same server:
+    // the request is sent again after 1 s, then after 2 s.
+    #[tokio::test]
+    async fn a_rank_not_ready_is_waited_out_on_the_same_server() {
+        let (server, k) = one_cluster("127.0.0.232", 2).await;
+        refusing_status(&server, "[HA] Unavailable: Producer not available", 2);
+        let before = server.behavior.count("/show/system/status");
+        let started = std::time::Instant::now();
+        k.show_system_status().await.expect("answered once the rank is ready");
+        assert_eq!(server.behavior.count("/show/system/status") - before, 3, "sent, then re-sent twice");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(3), "waited 1 s, then 2 s: {:?}", started.elapsed());
+    }
+
+    // A rank still not ready once the request's re-sends are spent fails it
+    // over; with one cluster that fails the request, with the server's
+    // message.
+    #[tokio::test]
+    async fn a_rank_still_not_ready_after_the_retries_fails_over() {
+        let (server, k) = one_cluster("127.0.0.234", 1).await;
+        refusing_status(&server, "[HA] Unavailable: Consumer not created", usize::MAX);
+        let before = server.behavior.count("/show/system/status");
+        let err = k.show_system_status().await.unwrap_err();
+        assert_eq!(server.behavior.count("/show/system/status") - before, 2, "sent, then re-sent once");
+        assert!(err.to_string().contains("Consumer not created"), "{err}");
+    }
+
+    // A draining HA queue shares the not-ready messages' prefix, and is not
+    // re-sent.
+    #[tokio::test]
+    async fn a_draining_ha_queue_is_not_re_sent() {
+        let (server, k) = one_cluster("127.0.0.238", 2).await;
+        refusing_status(&server, "[HA] Unavailable: Draining HA queue", usize::MAX);
+        let before = server.behavior.count("/show/system/status");
+        k.show_system_status().await.unwrap_err();
+        assert_eq!(server.behavior.count("/show/system/status") - before, 1, "sent once");
     }
 
     // The scheme, host, port and path, with one slash between path and
@@ -5157,6 +5326,49 @@ mod connection_tests {
         chosen.set_host_manager_port(9301);
         let k = Kinetica::new(vec![head.url.to_string()], chosen).await.expect("client");
         assert_eq!(k.hm_url().unwrap().port(), Some(9301), "the caller's port, chosen");
+    }
+
+    /// The properties of a cluster in an HA ring, whose head rank advertises
+    /// `advertised` and whose ring is the head nodes `ring`.
+    fn ring_properties(advertised: &str, ring: &[&str]) -> HashMap<String, String> {
+        let mut properties = cluster_properties(advertised, &[]);
+        properties.insert("conf.enable_ha".to_string(), "TRUE".to_string());
+        properties.insert("conf.ha_ring_head_nodes_full".to_string(), ring.join(";"));
+        properties
+    }
+
+    // A cluster reached at an address it does not advertise, whose advertised
+    // head rank address does not answer (behind a proxy or NAT, say), is used
+    // through the given URL with its head node only. That limits only how
+    // records reach it: its ring peer is still found, and the peer, naming the
+    // cluster by its advertised address, finds the cluster already recorded
+    // rather than adding a third that never ran.
+    #[tokio::test]
+    async fn a_cluster_limited_to_its_head_node_still_finds_its_ring_and_is_recorded_once() {
+        let a = fake_server::start("127.0.0.240").await;
+        let b = fake_server::start("127.0.0.241").await;
+        // Nothing listens there
+        let a_advertised = "http://127.0.0.242:1";
+        let ring = [a_advertised, &address(&b)];
+        *a.behavior.properties.lock() = ring_properties(a_advertised, &ring);
+        *b.behavior.properties.lock() = ring_properties(&address(&b), &ring);
+
+        let k = Kinetica::new(vec![a.url.to_string()], options()).await.expect("client");
+
+        let clusters = k.host_addresses();
+        assert_eq!(clusters.len(), 2, "A and its peer B, and no third: {clusters:?}");
+        let (a_record, b_record) = (&clusters[0], &clusters[1]);
+        assert_eq!(a_record.active_head_node_url(), &a.url, "A is used through the given URL");
+        assert!(!a_record.is_multi_head_available(), "A is limited to its head node");
+        assert!(a_record.does_cluster_contain_node("127.0.0.242"), "A's advertised address is recorded");
+        assert!(a_record.does_cluster_contain_node("127.0.0.240"), "so is the address it was reached at");
+        assert!(b_record.does_cluster_contain_node("127.0.0.241"), "B is the peer: {b_record:?}");
+        assert_eq!(k.url(), Some(a.url.clone()));
+
+        // Given both, B's ring still names A by its advertised address
+        let k = Kinetica::new(vec![a.url.to_string(), b.url.to_string()], options()).await.expect("client");
+        let clusters = k.host_addresses();
+        assert_eq!(clusters.len(), 2, "given both, still no third: {clusters:?}");
     }
 
     #[tokio::test]

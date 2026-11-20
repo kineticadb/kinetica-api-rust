@@ -126,8 +126,8 @@ struct FieldDef {
 /// The builder writes each name, namespace and doc through this, so every
 /// string in the schema it emits is escaped correctly.
 fn json_string(s: &str) -> String {
-    // Serialising a &str cannot fail.
-    serde_json::to_string(s).expect("serialising a string to JSON is infallible")
+    // Serializing a &str cannot fail.
+    serde_json::to_string(s).expect("serializing a string to JSON is infallible")
 }
 
 impl FieldDef {
@@ -543,7 +543,7 @@ impl KineticaColumnProperties {
         self
     }
 
-    // Further column properties. Parameterised ones are written in the form
+    // Further column properties. Parameterized ones are written in the form
     // 'array(int, 10)', 'vector(1000)' or 'compress(zstd(7))', for example.
 
     /// Enables full text search on this (string) column
@@ -633,7 +633,7 @@ impl KineticaColumnProperties {
     /// Sets the SQL-syntax default expression shown in generated DDL, i.e.
     /// `default_sql(expr)`
     ///
-    /// The parenthesised form here follows `default(expr)`. Use
+    /// The parenthesized form here follows `default(expr)`. Use
     /// [`property`](Self::property) if a server expects something else.
     pub fn default_sql(mut self, expr: &str) -> Self {
         self.properties.push(format!("default_sql({expr})"));

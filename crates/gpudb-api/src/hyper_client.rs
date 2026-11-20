@@ -709,8 +709,11 @@ impl HyperClient {
     ///
     /// - Failing to send the request or to receive a response, including a
     ///   timeout, is a [`KineticaError::Connection`], which fails over.
-    /// - A TLS failure is a [`KineticaError::Config`], which does not: another
-    ///   cluster would present the same certificate problem.
+    /// - A TLS failure is a [`KineticaError::Config`], which does not: a
+    ///   certificate, trust or protocol problem, which every attempt and every
+    ///   cluster would meet again. A handshake the server closes or resets is
+    ///   not one: it is a failure to send, retried and then failed over, as
+    ///   nothing of the request reached the server.
     /// - Failing to read the body, including a timeout, is a
     ///   [`KineticaError::Http`].
     ///
@@ -1434,6 +1437,54 @@ mod connection_tests {
 
     async fn post(client: &HyperClient, url: &str) -> Result<RawResponse, KineticaError> {
         client.post_binary_raw(url, b"payload".to_vec(), &RequestHeaders::default(), false).await
+    }
+
+    /// An `https` URL whose server reads each client's TLS ClientHello and
+    /// then cuts the handshake off: closing the connection cleanly, so the
+    /// client reads an end of stream, or resetting it if `reset`. Counts the
+    /// connections it takes.
+    async fn spawn_handshake_cutting_server(reset: bool) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}/x", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = connections.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                if reset {
+                    // Closing with some of the record unread resets the
+                    // connection
+                    let mut byte = [0u8; 1];
+                    let _ = stream.read(&mut byte).await;
+                } else {
+                    // The whole record, a 5-byte header giving its length,
+                    // then the body: a close with unread data is a reset
+                    let mut header = [0u8; 5];
+                    if stream.read_exact(&mut header).await.is_ok() {
+                        let mut body = vec![0u8; usize::from(u16::from_be_bytes([header[3], header[4]]))];
+                        let _ = stream.read_exact(&mut body).await;
+                    }
+                    let _ = stream.shutdown().await;
+                }
+                drop(stream);
+            }
+        });
+        (url, connections)
+    }
+
+    // A server that closes or resets the connection during the TLS handshake
+    // refused a connection, not a certificate: the request is sent again,
+    // and then fails as a connection failure, which fails over, not as a
+    // TLS failure, which would not.
+    #[tokio::test]
+    async fn a_handshake_the_server_cuts_off_is_retried_as_a_connection_failure() {
+        for reset in [false, true] {
+            let (url, connections) = spawn_handshake_cutting_server(reset).await;
+            let err = post(&HyperClient::with_config(&retrying(2, 2_000)), &url).await.unwrap_err();
+            assert!(matches!(err, KineticaError::Connection(_)), "reset {reset}: {err:?}");
+            assert!(!err.to_string().contains("trust store"), "reset {reset}: no certificate advice: {err}");
+            assert_eq!(connections.load(Ordering::SeqCst), 3, "reset {reset}: the first attempt and two retries");
+        }
     }
 
     #[tokio::test]

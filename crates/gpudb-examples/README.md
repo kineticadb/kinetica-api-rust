@@ -17,6 +17,9 @@ variables:
 | `KINETICA_BYPASS_SSL` | unset | `1` accepts any server certificate, such as a self-signed one |
 | `KINETICA_HOST` | `localhost` | Host of the PostgreSQL endpoint (port 5432), for the SQLx examples |
 
+Where `KINETICA_URL`, `KINETICA_USER` or `KINETICA_PASSWORD` is unset or empty,
+`KI_URL`, `KI_USER` or `KI_PWD` is used in its place.
+
 Run one from the root of the repository:
 
 ```bash

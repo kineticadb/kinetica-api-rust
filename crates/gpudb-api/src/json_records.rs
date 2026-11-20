@@ -272,12 +272,28 @@ impl Kinetica {
     async fn submit_json_request(&self, endpoint: &str, payload: Option<&str>) -> Result<String, KineticaError> {
         let mut url = self.url().ok_or_else(|| KineticaError::Connection("No URL available".to_string()))?;
         let original_url = url.clone();
+		// Number of re-sends when a rank was not ready; fail-over resets it.
+        let mut not_ready_resends = 0;
 
         loop {
             let current_cluster_switch_count = self.num_cluster_switches();
             let full_url = crate::gpudb::append_path_to_url(&url, endpoint).to_string();
             let error = match self.submit_json_request_raw(&full_url, payload).await {
                 Ok(json) => return Ok(json),
+                // A rank rebuilding its HA client refused the request before
+                // handling it: wait, then send it to the same server again,
+                // up to max_retries times, before failing over.
+                Err(e) if crate::gpudb::is_rank_not_ready(&e) && not_ready_resends < self.max_retries() => {
+                    let wait = crate::gpudb::rank_not_ready_wait(not_ready_resends);
+                    not_ready_resends += 1;
+                    warn!(
+                        "Endpoint {endpoint} at {url} is not ready: {e}; re-sending in {}s (re-send {not_ready_resends} of {})",
+                        wait.as_secs(),
+                        self.max_retries()
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
                 Err(e @ (KineticaError::Exit(_) | KineticaError::Connection(_))) => {
                     warn!("Got an exit error when trying endpoint {endpoint} at {url}: {e}; switch URL...");
                     e
@@ -295,6 +311,7 @@ impl Kinetica {
                 Ok(new_url) => {
                     debug!("Switched to {new_url}");
                     url = new_url;
+                    not_ready_resends = 0;
                 }
                 Err(KineticaError::HaUnavailable(ha) | KineticaError::FailoverDisabled(ha)) => {
                     return Err(crate::gpudb::failover_exhausted(&error, &ha));
@@ -316,8 +333,10 @@ impl Kinetica {
 }
 
 /// Interprets a JSON answer. With a payload, the answer must be a JSON
-/// object, which is read before anything else; a 400 whose message says the
-/// server is shutting down is an exit.
+/// object, which is read before anything else. An error whose message says
+/// the rank's HA client is not ready is an exit carrying that message,
+/// whatever the status, which `is_rank_not_ready` recognizes; a 400 whose
+/// message says the server is shutting down is an exit.
 fn interpret_json_response(url: &str, resp: &RawResponse, posted: bool) -> Result<String, KineticaError> {
     let (status, reason) = (resp.status, resp.reason.as_str());
     let json = String::from_utf8_lossy(&resp.body).into_owned();
@@ -348,6 +367,15 @@ fn interpret_json_response(url: &str, resp: &RawResponse, posted: bool) -> Resul
     if status == 401 || status == 403 {
         debug!("Got status code: {status}");
         return Err(KineticaError::Unauthorized(format!("Server response status: {status} : {reason}")));
+    }
+
+	// Decided by the message before the status
+    if let Some(message) = object.as_ref().and_then(|object| object.get("message")).map(json_text) {
+        let is_error = object.as_ref().and_then(|object| object.get("status")).map(json_text).is_some_and(|s| s == "ERROR");
+        if is_error && crate::gpudb::is_rank_not_ready_message(&message) {
+            debug!("Returning a rank-not-ready exit error from {url}; response_code: {status}; message: {message}");
+            return Err(KineticaError::Exit(message));
+        }
     }
 
     let exit_messages = ["Kinetica is exiting", "Connection refused", "Connection reset", "system-limited-fatal", "Kinetica is offline"];
@@ -1014,6 +1042,19 @@ mod tests {
         assert!(matches!(classify(503, "Service Unavailable", None, "<html>", true), Err(KineticaError::Http(_))));
         // Without a payload it is not read
         assert_eq!(classify(200, "OK", None, "[1]", false).unwrap(), "[1]");
+    }
+
+    // A rank whose HA client is not ready is an exit carrying its message,
+    // whatever the status, and is recognized for a re-send.
+    #[test]
+    fn a_json_rank_not_ready_is_an_exit_whatever_the_status() {
+        let message = "[HA] Unavailable: Producer not available";
+        let body = format!(r#"{{"status":"ERROR","message":"{message}"}}"#);
+        for (status, reason) in [(400, "Bad Request"), (500, "Internal Server Error")] {
+            let err = interpret_json_response("http://h/x", &response(status, reason, None, &body), true).unwrap_err();
+            assert!(matches!(err, KineticaError::Exit(ref m) if m == message), "{status}: {err:?}");
+            assert!(crate::gpudb::is_rank_not_ready(&err), "{status}: {err:?}");
+        }
     }
 
     /// A response whose one record has `v` and whose `data` has `t`, both

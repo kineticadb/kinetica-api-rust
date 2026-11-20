@@ -451,7 +451,7 @@ pub(crate) fn parse_shard_value<'a>(
         ShardColumnType::Timestamp => {
             ShardKeyValue::Timestamp(value.parse().map_err(|e| bad(value, "timestamp", e))?)
         }
-        // Never an error: any word not recognised maps to false. See
+        // Never an error: any word not recognized maps to false. See
         // `parse_boolean_text`.
         ShardColumnType::Boolean => ShardKeyValue::Boolean(parse_boolean_text(value)),
         ShardColumnType::DateTime => ShardKeyValue::DateTime(value),
@@ -574,7 +574,7 @@ impl RecordKeyBuilder {
     ///
     /// Lenient: a value that will not parse as its column's type encodes as a
     /// null rather than failing, because a record may carry a placeholder for
-    /// a column the server initialises. Use [`Self::build`] for a
+    /// a column the server initializes. Use [`Self::build`] for a
     /// look-up, where an unusable value is an error.
     ///
     /// Returns `None` if the table has no shard key.
@@ -1127,7 +1127,7 @@ mod shard_dispatch_tests {
 
     #[test]
     fn an_ingest_tolerates_text_that_does_not_parse_as_its_type() {
-        // A placeholder for a column the server initialises: a uuid or date
+        // A placeholder for a column the server initializes: a uuid or date
         // column writes zero for text it cannot read.
         for (data_type, props) in [("string", &["uuid"][..]), ("string", &["date"][..])] {
             let b = builder_for(data_type, props);

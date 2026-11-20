@@ -108,8 +108,8 @@ mod example {
         println!("=== SQLx with JSON, Arrays and Vectors ===\n");
 
         let host = std::env::var("KINETICA_HOST").unwrap_or_else(|_| "localhost".to_string());
-        let username = std::env::var("KINETICA_USER").unwrap_or_else(|_| "admin".to_string());
-        let password = std::env::var("KINETICA_PASSWORD").unwrap_or_else(|_| "password".to_string());
+        let username = gpudb_examples::common::kinetica_user();
+        let password = gpudb_examples::common::kinetica_password();
 
         // One connection is all a sequence of statements needs
         let pool = KineticaPoolOptions::new()

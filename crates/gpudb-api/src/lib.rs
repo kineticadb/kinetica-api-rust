@@ -194,7 +194,7 @@ pub use crate::generated::*;
 /// dependency pinned to a matching version.
 pub use serde_bytes::ByteBuf;
 pub use crate::avro_schema_builder::{AvroSchemaBuilder, AvroType, TypePropertiesBuilder, KineticaColumnProperties};
-pub use crate::record_retriever::{RecordRetriever, RecordRetrieverOptions, RetrievedRecord, END_OF_SET};
+pub use crate::record_retriever::{RecordEncoding, RecordRetriever, RecordRetrieverOptions, RetrievedRecord, END_OF_SET};
 pub use crate::avro::{
     // Encoding API
     encode_records, encode_records_parallel, encode_records_sequential,

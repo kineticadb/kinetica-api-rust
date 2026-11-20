@@ -29,7 +29,7 @@ cargo run -p gpudb-examples --bin load_generator --release
 
 | Variable | Description |
 |----------|-------------|
-| `KINETICA_URL` | Kinetica server URL (e.g., `http://localhost:9191`) |
+| `KINETICA_URL` | Kinetica server URL (e.g., `http://localhost:9191`); `KI_URL` where unset |
 | `KINETICA_TABLE` | Target table name (will be created if not exists) |
 | `TOTAL_RECORDS` | Total number of records to insert |
 
@@ -37,8 +37,8 @@ cargo run -p gpudb-examples --bin load_generator --release
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `KINETICA_USER` | `admin` | Authentication username |
-| `KINETICA_PASSWORD` | `password` | Authentication password |
+| `KINETICA_USER` | `KI_USER`, else `admin` | Authentication username |
+| `KINETICA_PASSWORD` | `KI_PWD`, else `password` | Authentication password |
 | `KINETICA_BATCH_SIZE` | `10000` | Records per batch sent to server |
 | `KINETICA_MULTIHEAD` | `true` | Enable multi-head ingest (direct to workers) |
 | `NUM_THREADS` | `1` | Number of producer threads |

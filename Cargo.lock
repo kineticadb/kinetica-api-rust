@@ -150,7 +150,7 @@ dependencies = [
  "nom",
  "num-traits",
  "rusticata-macros",
- "thiserror 2.0.18",
+ "thiserror",
  "time",
 ]
 
@@ -762,7 +762,6 @@ checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
 dependencies = [
  "futures-core",
  "futures-sink",
- "nanorand",
  "spin",
 ]
 
@@ -904,10 +903,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "wasi",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -947,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "gpudb-api"
-version = "7.2.3-0"
+version = "7.2.3"
 dependencies = [
  "arc-swap",
  "byteorder",
@@ -981,11 +978,12 @@ dependencies = [
  "serde_avro_fast",
  "serde_bytes",
  "serde_json",
+ "serde_serializer_quick_unsupported",
  "smallvec",
  "snap",
  "socket2",
  "sqlx",
- "thiserror 2.0.18",
+ "thiserror",
  "tokio",
  "tokio-rustls",
  "tokio-test",
@@ -1575,15 +1573,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9252111cf132ba0929b6f8e030cac2a24b507f3a4d6db6fb2896f27b354c714b"
 
 [[package]]
-name = "nanorand"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a51313c5820b0b02bd422f4b44776fbf47961755c74ce64afc73bfad10226c3"
-dependencies = [
- "getrandom 0.2.17",
-]
-
-[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1722,7 +1711,7 @@ dependencies = [
  "rc2",
  "sha1 0.11.0",
  "sha2 0.11.0",
- "thiserror 2.0.18",
+ "thiserror",
  "x509-parser",
 ]
 
@@ -2400,21 +2389,21 @@ dependencies = [
 
 [[package]]
 name = "serde_avro_fast"
-version = "2.0.0"
+version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ed59cbaf90bc3d5f02bace18d57b46f41366c176b1be6da28fddf4d1960adc6"
+checksum = "b6dd83cb2593bb7f8285f9be62b3e37d7ca652e069a6760acddfa6eaee9e2928"
 dependencies = [
  "flate2",
  "integer-encoding",
  "num-traits",
- "rand 0.8.5",
+ "rand 0.10.3",
  "rust_decimal",
  "serde",
  "serde-transcode",
  "serde_derive",
  "serde_json",
  "serde_serializer_quick_unsupported",
- "thiserror 1.0.69",
+ "thiserror",
 ]
 
 [[package]]
@@ -2462,9 +2451,9 @@ dependencies = [
 
 [[package]]
 name = "serde_serializer_quick_unsupported"
-version = "0.1.2"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "deb65c5dbc9079c6913d2120b1b4112cce4e2295b7f152ca52d7f48e19ad5396"
+checksum = "910d138e01d68a0af36685fee444b2224a3926eba836812ba887442bc778f8d4"
 
 [[package]]
 name = "serde_urlencoded"
@@ -2655,7 +2644,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "smallvec",
- "thiserror 2.0.18",
+ "thiserror",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -2738,7 +2727,7 @@ dependencies = [
  "smallvec",
  "sqlx-core",
  "stringprep",
- "thiserror 2.0.18",
+ "thiserror",
  "tracing",
  "whoami",
 ]
@@ -2776,7 +2765,7 @@ dependencies = [
  "smallvec",
  "sqlx-core",
  "stringprep",
- "thiserror 2.0.18",
+ "thiserror",
  "tracing",
  "whoami",
 ]
@@ -2801,7 +2790,7 @@ dependencies = [
  "serde",
  "serde_urlencoded",
  "sqlx-core",
- "thiserror 2.0.18",
+ "thiserror",
  "tracing",
  "url",
 ]
@@ -2866,31 +2855,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
 dependencies = [
- "thiserror-impl 2.0.18",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
+ "thiserror-impl",
 ]
 
 [[package]]
@@ -3746,7 +3715,7 @@ dependencies = [
  "oid-registry",
  "ring",
  "rusticata-macros",
- "thiserror 2.0.18",
+ "thiserror",
  "time",
 ]
 

@@ -621,7 +621,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // Get Kinetica URL
-    let url = std::env::var("KINETICA_URL").unwrap_or_else(|_| "http://localhost:9191".to_string());
+    let url = gpudb_examples::common::kinetica_url().unwrap_or_else(|| "http://localhost:9191".to_string());
     println!("Connecting to Kinetica at: {url}");
 
     // Create client

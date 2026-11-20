@@ -1060,7 +1060,7 @@ fn original_causes(worker_url: &str, error: &KineticaError) -> String {
 /// How many flush workers to start for a requested `num_workers`.
 ///
 /// A request of `0` gets one worker per CPU (`cpus`).
-/// Any other request is honoured as given -- the caller asked for it, and
+/// Any other request is honored as given -- the caller asked for it, and
 /// this crate's constructors have always taken it -- where it used to be
 /// silently clamped to between 4 and twice the CPU count.
 fn flush_worker_count(requested: usize, cpus: usize) -> usize {
@@ -1736,7 +1736,7 @@ impl<T: Serialize + ShardKeyExtractor + Send + Sync + 'static> BulkInserter<T> {
             tokio::spawn(async move {
                 loop {
                     let job = tokio::select! {
-                        // Drain queued batches before honouring a shutdown.
+                        // Drain queued batches before honoring a shutdown.
                         biased;
                         job = rx_worker.recv_async() => match job {
                             Ok(job) => job,
@@ -2411,15 +2411,19 @@ impl<T: Serialize + ShardKeyExtractor + Send + Sync + 'static> BulkInserter<T> {
         //   such as a server-side data error, fails the batch at once.
         // - `max_retries` counts retries after the first attempt, so 0 means
         //   one attempt.
-        // - Retries are immediate, with no back-off. A brief outage can
-        //   therefore use up the retries in quick succession before a
-        //   failover is tried.
+        // - Retries are immediate, with no back-off, except after a rank
+        //   refused the batch because its HA client is not ready: that
+        //   clears within seconds, so each such retry first waits 1 s,
+        //   doubling to at most 8 s. Any other brief outage can use up the
+        //   retries in quick succession before a failover is tried.
         // - When they run out, a single cluster gives up. Otherwise the
         //   inserter fails over and starts again on the new cluster with the
         //   full retry count. That ends when the failover walk has tried every
         //   cluster in the ring and reports HA unavailable.
         let mut attempt = 0usize;
         let mut retries_left = max_retries;
+        // Retries after a rank was not ready, which set the next wait
+        let mut not_ready_resends = 0usize;
 
         let failure = loop {
             match self.submit_batch(&current_worker_url, &req, record_count).await {
@@ -2492,6 +2496,12 @@ impl<T: Serialize + ShardKeyExtractor + Send + Sync + 'static> BulkInserter<T> {
                     warn!("Batch insert attempt {} to {current_worker_url} failed: {e}", attempt + 1);
 
                     if retries_left > 0 {
+                        if crate::gpudb::is_rank_not_ready(&e) {
+                            let wait = crate::gpudb::rank_not_ready_wait(not_ready_resends);
+                            not_ready_resends += 1;
+                            debug!("Rank at {current_worker_url} is not ready; retrying the batch in {}s", wait.as_secs());
+                            tokio::time::sleep(wait).await;
+                        }
                         retries_left -= 1;
                         attempt += 1;
                         continue;
@@ -4265,6 +4275,46 @@ mod json_tests {
         expected.sort();
         assert_eq!(received, expected);
         assert_eq!(head.behavior.count("/insert/records"), 0);
+        inserter.close().await.unwrap();
+    }
+
+    // A rank whose HA client is not ready is waited out: the batch is sent to
+    // it again after 1 s, within the inserter's retries.
+    #[tokio::test]
+    async fn a_batch_a_rank_was_not_ready_for_is_waited_out() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let head = fake_server::start("127.0.0.235").await;
+        *head.behavior.properties.lock() = cluster_properties(&address(&head), &[]);
+        head_handler(&head, Vec::new());
+        let (refusals, sends) = (Arc::new(AtomicUsize::new(1)), Arc::new(AtomicUsize::new(0)));
+        let (left, sent) = (refusals.clone(), sends.clone());
+        *head.behavior.json_handler.lock() = Some(Arc::new(move |path: &str, body: &[u8]| {
+            path.strip_prefix("/insert/records/json?")?;
+            sent.fetch_add(1, SeqCst);
+            if left.fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1)).is_ok() {
+                let refusal = r#"{"status":"ERROR","message":"[HA] Unavailable: Consumer not created"}"#;
+                return Some(("400 Bad Request".to_string(), refusal.to_string()));
+            }
+            let count = serde_json::from_str::<Vec<serde_json::Value>>(&String::from_utf8_lossy(body)).map_or(0, |r| r.len());
+            Some((
+                "200 OK".to_string(),
+                format!(r#"{{"status":"OK","message":"","data":{{"count_inserted":{count},"count_updated":0}}}}"#),
+            ))
+        }));
+        let k = client(&head).await;
+
+        let mut options = BulkInserterOptions::new();
+        options.set_max_retries(1);
+        let inserter = BulkInserter::with_json_options(k, "t".into(), 10, 1, Some(options), JsonOptions::default())
+            .await
+            .expect("inserter");
+        let started = std::time::Instant::now();
+        inserter.insert_batch(records(&[r#"{"id":1}"#, r#"{"id":2}"#, r#"{"id":3}"#])).unwrap();
+        inserter.flush().await.unwrap();
+        assert_eq!(inserter.count_inserted(), 3);
+        assert!(inserter.drain_errors().is_empty());
+        assert_eq!(sends.load(SeqCst), 2, "sent, then re-sent once");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1), "waited 1 s: {:?}", started.elapsed());
         inserter.close().await.unwrap();
     }
 

@@ -1,60 +1,65 @@
 //! Records what the client reports of itself: the compiler version, which it
 //! reports in its `User-Agent` header, and the API version.
 //!
-//! The API version is the crate's own version, `MAJOR.MINOR.REVISION-ABI`,
-//! reported as `MAJOR.MINOR.REVISION.ABI`: `7.2.3-0` is `7.2.3.0`. The build
-//! number is the time of the build, `yyyyMMddHHmmss`.
-//!
-//! The repository's `VERSION` file is the source of the crate version: the
-//! schema-processing script in gpudb-generators writes it into `Cargo.toml`,
-//! as Cargo versions have only three numbers and take the ABI version as a
-//! pre-release.
+//! The API version is the crate's own SemVer version, `MAJOR.MINOR.PATCH`:
+//! `MAJOR.MINOR` is the Kinetica version the crate implements, and `PATCH`
+//! counts the crate's own releases of it. The build number is the time of the
+//! build, `yyyyMMddHHmmss`.
 
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
+    println!("cargo:rustc-env=GPUDB_RUSTC_VERSION={}", rustc_version());
+    println!("cargo:rerun-if-env-changed=RUSTC");
+
+    let api_version = release_version();
+    let build = build_number();
+
+    println!("cargo:rustc-env=GPUDB_API_VERSION={api_version}");
+    println!("cargo:rustc-env=GPUDB_API_BUILD_NUMBER={build}");
+    // The version is in the manifest; a new one stamps a new build number
+    println!("cargo:rerun-if-changed=Cargo.toml");
+}
+
+/// The version of the compiler building the crate, `1.88.0` from
+/// `rustc 1.88.0 (6b00bc388 2025-06-23)`, or `unknown` if it cannot be read.
+fn rustc_version() -> String {
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    // "rustc 1.88.0 (6b00bc388 2025-06-23)" -> "1.88.0"
-    let version = Command::new(rustc)
+    Command::new(rustc)
         .arg("--version")
         .output()
         .ok()
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .and_then(|text| text.split_whitespace().nth(1).map(str::to_string))
-        .unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=GPUDB_RUSTC_VERSION={version}");
-    println!("cargo:rerun-if-env-changed=RUSTC");
+        .unwrap_or_else(|| "unknown".to_string())
+}
 
-    // MAJOR.MINOR.REVISION.ABI, from the crate version's MAJOR.MINOR.REVISION
-    // and its pre-release, the ABI version
+/// The release version, the crate's `MAJOR.MINOR.PATCH`.
+///
+/// Panics if the crate version is a pre-release (`7.2.3-1`): releases are
+/// plain SemVer, so one would be a manifest written in another scheme.
+fn release_version() -> String {
     let part = |name: &str| std::env::var(format!("CARGO_PKG_VERSION_{name}")).unwrap_or_default();
-    let abi = part("PRE");
-    if abi.is_empty() || !abi.bytes().all(|b| b.is_ascii_digit()) {
+
+    if !part("PRE").is_empty() {
         panic!(
-            "the crate version {} is not MAJOR.MINOR.REVISION-ABI, as the schema-processing \
-             script writes it from VERSION",
+            "the crate version {} is a pre-release; release versions are MAJOR.MINOR.PATCH",
             std::env::var("CARGO_PKG_VERSION").unwrap_or_default()
         );
     }
-    let api_version = format!(
-        "{}.{}.{}.{abi}",
-        part("MAJOR"),
-        part("MINOR"),
-        part("PATCH")
-    );
-    println!("cargo:rustc-env=GPUDB_API_VERSION={api_version}");
-    println!(
-        "cargo:rustc-env=GPUDB_API_VERSION_FULL={api_version}-{}",
-        build_timestamp()
-    );
-    // The version is in the manifest; a new one stamps a new build number
-    println!("cargo:rerun-if-changed=Cargo.toml");
+
+    format!("{}.{}.{}", part("MAJOR"), part("MINOR"), part("PATCH"))
 }
 
-/// The time of the build, `yyyyMMddHHmmss`, in UTC.
-fn build_timestamp() -> String {
+/// The build number: the time of the build, `yyyyMMddHHmmss`, in UTC.
+fn build_number() -> String {
     let seconds = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64;
+    utc_timestamp(seconds)
+}
+
+/// The time `seconds` after the epoch, `yyyyMMddHHmmss`, in UTC.
+fn utc_timestamp(seconds: i64) -> String {
     let (days, time) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
     // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm)
     let z = days + 719_468;

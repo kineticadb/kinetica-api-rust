@@ -19,7 +19,6 @@ use gpudb_api::{
 use serde::Serialize;
 use smallvec::smallvec;
 use std::collections::HashMap;
-use std::env;
 use std::sync::Arc;
 
 /// Test record with shard key columns
@@ -82,10 +81,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Configuration from environment
-    let kinetica_url =
-        env::var("KINETICA_URL").unwrap_or_else(|_| "http://localhost:9191".to_string());
-    let username = env::var("KINETICA_USER").unwrap_or_else(|_| "admin".to_string());
-    let password = env::var("KINETICA_PASSWORD").unwrap_or_else(|_| "password".to_string());
+    let kinetica_url = gpudb_examples::common::kinetica_url().unwrap_or_else(|| "http://localhost:9191".to_string());
+    let username = gpudb_examples::common::kinetica_user();
+    let password = gpudb_examples::common::kinetica_password();
     let table_name = "test_shard_key_rust";
 
     println!("=== RecordRetriever Example (Rust) ===");

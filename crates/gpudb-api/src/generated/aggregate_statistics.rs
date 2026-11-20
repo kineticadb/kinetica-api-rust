@@ -30,7 +30,8 @@ impl Kinetica {
     ///
     /// A second, comma-separated value can be added to the percentile statistic
     /// to calculate percentile resolution, e.g., a 50th percentile with 200
-    /// resolution would be 'percentile(50,200)'.
+    /// resolution would be 'percentile(50,200)'. The allowable range of the
+    /// percentile resolution is 10 to 10000, with a default value of 100.
     ///
     /// The weighted average statistic requires a weight column to be specified
     /// in weight_column_name. The weighted average is then defined as the sum
@@ -94,7 +95,8 @@ impl Kinetica {
     ///
     /// A second, comma-separated value can be added to the percentile statistic
     /// to calculate percentile resolution, e.g., a 50th percentile with 200
-    /// resolution would be 'percentile(50,200)'.
+    /// resolution would be 'percentile(50,200)'. The allowable range of the
+    /// percentile resolution is 10 to 10000, with a default value of 100.
     ///
     /// The weighted average statistic requires a weight column to be specified
     /// in weight_column_name. The weighted average is then defined as the sum

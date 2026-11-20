@@ -50,8 +50,8 @@ mod example {
 
         // Get connection info from environment
         let host = std::env::var("KINETICA_HOST").unwrap_or_else(|_| "localhost".to_string());
-        let username = std::env::var("KINETICA_USER").unwrap_or_else(|_| "admin".to_string());
-        let password = std::env::var("KINETICA_PASSWORD").unwrap_or_else(|_| "password".to_string());
+        let username = gpudb_examples::common::kinetica_user();
+        let password = gpudb_examples::common::kinetica_password();
 
         // Create connection pool with options
         println!("Connecting to Kinetica via PostgreSQL wire protocol...");

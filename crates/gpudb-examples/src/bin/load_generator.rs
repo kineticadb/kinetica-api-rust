@@ -6,13 +6,13 @@
 //! # Environment Variables
 //!
 //! Required:
-//! - `KINETICA_URL` - Kinetica server URL
+//! - `KINETICA_URL` (or `KI_URL`) - Kinetica server URL
 //! - `KINETICA_TABLE` - Target table name (will be created if not exists)
 //! - `TOTAL_RECORDS` - Total number of records to insert
 //!
 //! Optional:
-//! - `KINETICA_USER` - Username (default: "admin")
-//! - `KINETICA_PASSWORD` - Password (default: "password")
+//! - `KINETICA_USER` (or `KI_USER`) - Username (default: "admin")
+//! - `KINETICA_PASSWORD` (or `KI_PWD`) - Password (default: "password")
 //! - `KINETICA_BATCH_SIZE` - Records per batch (default: 10000)
 //! - `KINETICA_MULTIHEAD` - Enable multi-head ingest (default: true)
 //! - `SNAPPY` - Enable Snappy compression (default: true)
@@ -195,9 +195,10 @@ struct Config {
 impl Config {
     fn from_env() -> Result<Self, String> {
         Ok(Self {
-            url: required_env("KINETICA_URL")?,
-            username: env::var("KINETICA_USER").unwrap_or_else(|_| "admin".to_string()),
-            password: env::var("KINETICA_PASSWORD").unwrap_or_else(|_| "password".to_string()),
+            url: gpudb_examples::common::kinetica_url()
+                .ok_or_else(|| "Missing required environment variable: KINETICA_URL (or KI_URL)".to_string())?,
+            username: gpudb_examples::common::kinetica_user(),
+            password: gpudb_examples::common::kinetica_password(),
             table_name: required_env("KINETICA_TABLE")?,
             total_records: required_env_i64("TOTAL_RECORDS")?,
             batch_size: env_or_default_i32("KINETICA_BATCH_SIZE", 10_000) as usize,
