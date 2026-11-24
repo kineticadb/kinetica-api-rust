@@ -4,6 +4,7 @@
 //! layers for maximum performance, particularly for bulk insert operations.
 
 use crate::KineticaError;
+use crate::retry_rules::{self, failed_reply_message, RequestRetries, Resend};
 use hyper::{body::{Bytes, Incoming}, Request, Response, Uri};
 use hyper_rustls::HttpsConnector;
 use crate::connector::{ConnectionClock, TcpConnector, TcpSettings};
@@ -77,12 +78,15 @@ pub struct HttpClientConfig {
     /// How long a request waits for a free connection when a limit above is
     /// reached, before failing as a connection error.
     pub connection_request_timeout: Duration,
-    /// How many times an API request is retried, at once and on the same
-    /// server: when sending it fails without a response (the connection is
-    /// refused, reset or closed, the host is unknown, or no response arrives
-    /// within the timeout), or the response is a 502 or 503. A connect
-    /// timeout, a TLS failure or a failure reading the response body is not
-    /// retried, and neither are health checks.
+    /// How many times an API request is sent again to the same server, in
+    /// all, before it fails over: when sending it fails before it was
+    /// written in full (the connection is refused, reset or closed, the host
+    /// is unknown, or the connect times out), when the rank's HA client is not
+    /// ready yet (after a wait), or when the response is a `502`, `503` or
+    /// `504` that does not report the server's state. A TLS failure is not
+    /// re-sent, and neither are health checks. A request lost after it was
+    /// written in full is re-sent only to the read-only endpoints the client
+    /// itself uses, since the server may have applied it.
     pub max_retries: usize,
     /// Whether connections send TCP keep-alive probes: on by default with the
     /// operating system's timings.
@@ -326,6 +330,70 @@ async fn within<T>(
     }
 }
 
+/// The endpoints whose requests are re-sent even once written in full: reads
+/// that change nothing, so a second copy cannot apply anything twice. The
+/// client sends them itself to learn a cluster's tables, types, shards,
+/// properties and status, and to list KiFS files and directories.
+const REPEATABLE_ENDPOINTS: [&str; 7] = [
+    "/show/table",
+    "/show/types",
+    "/admin/show/shards",
+    "/show/system/properties",
+    "/show/system/status",
+    "/show/files",
+    "/show/directories",
+];
+
+/// Whether a request to `path` may be re-sent after it was written in full;
+/// see [`REPEATABLE_ENDPOINTS`]. The path may carry a prefix, as it does
+/// behind a reverse proxy (`/gpudb-0/show/table`).
+fn is_repeatable_endpoint(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    REPEATABLE_ENDPOINTS.iter().any(|endpoint| path.ends_with(endpoint))
+}
+
+/// Reads a response whole: its status, reason phrase, content type and body.
+///
+/// The body is read even on an error status: it may say what went wrong. A
+/// failure part way through is an HTTP error, a timeout included. The timeout
+/// bounds each read rather than the whole body: a large response still
+/// arriving is not cut off.
+async fn read_response(resp: Response<Incoming>, body_limit: Option<Duration>, url: &str) -> Result<RawResponse, KineticaError> {
+    let status = resp.status();
+    // hyper keeps the phrase only when it is not the standard one
+    let reason = resp
+        .extensions()
+        .get::<hyper::ext::ReasonPhrase>()
+        .map(|phrase| String::from_utf8_lossy(phrase.as_bytes()).into_owned())
+        .unwrap_or_else(|| status.canonical_reason().unwrap_or("").to_string());
+    let content_type = resp
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    let mut incoming = resp.into_body();
+    let mut parts: Vec<Bytes> = Vec::new();
+    loop {
+        match within(body_limit, "the response body", url, incoming.frame()).await {
+            Err(timeout) => return Err(KineticaError::Http(timeout.to_string())),
+            Ok(None) => break,
+            Ok(Some(Err(e))) => return Err(KineticaError::Http(format!("Failed to read response: {e}"))),
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    parts.push(data);
+                }
+            }
+        }
+    }
+    let body = match parts.len() {
+        0 => Bytes::new(),
+        1 => parts.pop().unwrap_or_default(),
+        _ => Bytes::from(parts.concat()),
+    };
+    Ok(RawResponse { status: status.as_u16(), reason, content_type, body })
+}
+
 /// Awaits the response to a request, giving up `limit` after the request has
 /// been sent, so an upload of any length is never cut off. `sent` is the
 /// request body's signal (see [`RequestBody::tracked`]). Fails as [`within`]
@@ -359,18 +427,24 @@ pub(crate) struct RequestBody {
     body: Full<Bytes>,
     taken: bool,
     sent: Option<tokio::sync::oneshot::Sender<()>>,
+    written: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl RequestBody {
-    /// A body of `bytes`, and the signal that it has been sent.
-    fn tracked(bytes: Bytes) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+    /// A body of `bytes`, the signal that the client is done with it, and
+    /// whether it was written: set once hyper has taken its data for the
+    /// connection, which the signal alone cannot tell apart from hyper giving
+    /// up on the request before writing it. An empty body is never written.
+    fn tracked(bytes: Bytes) -> (Self, tokio::sync::oneshot::Receiver<()>, Arc<std::sync::atomic::AtomicBool>) {
         let (sent, signal) = tokio::sync::oneshot::channel();
-        (Self { body: Full::new(bytes), taken: false, sent: Some(sent) }, signal)
+        let written = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body = Self { body: Full::new(bytes), taken: false, sent: Some(sent), written: Some(written.clone()) };
+        (body, signal, written)
     }
 
     /// An empty body, with no signal.
     fn empty() -> Self {
-        Self { body: Full::new(Bytes::new()), taken: false, sent: None }
+        Self { body: Full::new(Bytes::new()), taken: false, sent: None, written: None }
     }
 }
 
@@ -386,6 +460,9 @@ impl hyper::body::Body for RequestBody {
         let frame = std::pin::Pin::new(&mut this.body).poll_frame(cx);
         if let std::task::Poll::Ready(Some(_)) = &frame {
             this.taken = true;
+            if let Some(written) = &this.written {
+                written.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         }
         frame
     }
@@ -707,8 +784,14 @@ impl HyperClient {
     ///
     /// Failures are classified as follows:
     ///
-    /// - Failing to send the request or to receive a response, including a
-    ///   timeout, is a [`KineticaError::Connection`], which fails over.
+    /// - Failing to send the request, or to receive a response to one that
+    ///   was not written in full, including a timeout, is a
+    ///   [`KineticaError::Connection`], which fails over.
+    /// - Failing to receive a response to a request that was written in full
+    ///   (no response in time, or the connection closed or reset first) is a
+    ///   [`KineticaError::Http`]: the server may have applied it, so it is
+    ///   not sent again, except to the read-only endpoints in
+    ///   [`REPEATABLE_ENDPOINTS`].
     /// - A TLS failure is a [`KineticaError::Config`], which does not: a
     ///   certificate, trust or protocol problem, which every attempt and every
     ///   cluster would meet again. A handshake the server closes or resets is
@@ -717,9 +800,15 @@ impl HyperClient {
     /// - Failing to read the body, including a timeout, is a
     ///   [`KineticaError::Http`].
     ///
-    /// Before any of that, a failed send or a 502 or 503 is retried up to
-    /// [`HttpClientConfig::max_retries`] times; the last outcome is what is
-    /// classified.
+    /// Before any of that, the request is sent again to the same server, up
+    /// to [`HttpClientConfig::max_retries`] times in all, where a second copy
+    /// may get past the failure: a send that failed before the request was
+    /// written in full; a reply saying the rank's HA client is not ready yet,
+    /// after a wait of 1 s that doubles with each re-send, to at most 8 s; or
+    /// a `502`, `503` or `504` that does not report the server's state. The
+    /// server's message is read before the status: a `503` saying the
+    /// server is offline, exiting, draining its HA queue and the like is not
+    /// sent again. The last outcome is what is returned or classified.
     pub async fn post_binary_raw(
         &self,
         url: &str,
@@ -727,7 +816,8 @@ impl HyperClient {
         headers: &RequestHeaders,
         use_snappy: bool,
     ) -> Result<RawResponse, KineticaError> {
-        self.send_post(Route::Main, url, Payload::Binary { body, use_snappy }, headers).await
+        self.send_post(Route::Main, url, Payload::Binary { body, use_snappy }, headers, &RequestRetries::connection_default())
+            .await
     }
 
     /// Sends a POST request like [`Self::post_binary_raw`], with a body that is
@@ -736,14 +826,18 @@ impl HyperClient {
     /// For a caller that builds the body off the async runtime, compression
     /// included, and may send it more than once: `Bytes` clones without
     /// copying the payload.
+    ///
+    /// `retries` is the request's budget of re-sends, whether a second copy
+    /// is harmless, and the record of what its re-sends left behind.
     pub(crate) async fn post_encoded_raw(
         &self,
         url: &str,
         body: Bytes,
         snappy: bool,
         headers: &RequestHeaders,
+        retries: &RequestRetries,
     ) -> Result<RawResponse, KineticaError> {
-        self.send_post(Route::Main, url, Payload::Encoded { body, snappy }, headers).await
+        self.send_post(Route::Main, url, Payload::Encoded { body, snappy }, headers, retries).await
     }
 
     /// Sends an encoded, uncompressed body once, with no retries, waiting at
@@ -758,7 +852,8 @@ impl HyperClient {
         headers: &RequestHeaders,
         limit: Duration,
     ) -> Result<RawResponse, KineticaError> {
-        self.send_post(Route::Once(limit), url, Payload::Encoded { body, snappy: false }, headers).await
+        self.send_post(Route::Once(limit), url, Payload::Encoded { body, snappy: false }, headers, &RequestRetries::connection_default())
+            .await
     }
 
     /// Sends a POST with a JSON body, or with none, and returns the response
@@ -770,11 +865,22 @@ impl HyperClient {
         json: Option<String>,
         headers: &RequestHeaders,
     ) -> Result<RawResponse, KineticaError> {
+        self.post_json_with_retries(url, json, headers, &RequestRetries::connection_default()).await
+    }
+
+    /// Sends a POST like [`Self::post_json_raw`], re-sent as `retries` allows.
+    pub(crate) async fn post_json_with_retries(
+        &self,
+        url: &str,
+        json: Option<String>,
+        headers: &RequestHeaders,
+        retries: &RequestRetries,
+    ) -> Result<RawResponse, KineticaError> {
         let payload = match json {
             Some(json) => Payload::Json(json),
             None => Payload::Empty,
         };
-        self.send_post(Route::Main, url, payload, headers).await
+        self.send_post(Route::Main, url, payload, headers, retries).await
     }
 
     /// Sends a POST request like [`Self::post_binary_raw`], through the fast
@@ -790,7 +896,8 @@ impl HyperClient {
         body: Vec<u8>,
         headers: &RequestHeaders,
     ) -> Result<RawResponse, KineticaError> {
-        self.send_post(Route::Fast, url, Payload::Binary { body, use_snappy: false }, headers).await
+        self.send_post(Route::Fast, url, Payload::Binary { body, use_snappy: false }, headers, &RequestRetries::connection_default())
+            .await
     }
 
     async fn send_post(
@@ -799,6 +906,7 @@ impl HyperClient {
         url: &str,
         payload: Payload,
         headers: &RequestHeaders,
+        retries: &RequestRetries,
     ) -> Result<RawResponse, KineticaError> {
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(KineticaError::Config(format!(
@@ -808,16 +916,15 @@ impl HyperClient {
 
         // Each limit here bounds the wait for the response once the request is
         // sent, and then each read of its body, never the upload.
-        let (client, limits, response_limit, body_limit, max_retries) = match route {
+        let (client, limits, response_limit, body_limit) = match route {
             Route::Fast => (
                 &self.fast_client,
                 &self.health_check_limits,
                 Some(FAST_CONNECTION_TIMEOUT),
                 Some(FAST_CONNECTION_TIMEOUT),
-                0,
             ),
-            Route::Main => (&self.client, &self.limits, self.request_timeout, self.request_timeout, self.max_retries),
-            Route::Once(limit) => (&self.client, &self.limits, Some(limit), Some(limit), 0),
+            Route::Main => (&self.client, &self.limits, self.request_timeout, self.request_timeout),
+            Route::Once(limit) => (&self.client, &self.limits, Some(limit), Some(limit)),
         };
         // Parse URI
         let uri: Uri = url.parse()
@@ -835,12 +942,28 @@ impl HyperClient {
             Payload::Encoded { body, snappy: false } => (Some("application/octet-stream"), body),
         };
 
-        // Executions are counted from 1, and a retry is made while the count
-        // is at most max_retries, so a request is sent up to max_retries + 1
-        // times, with no pause in between.
-        let mut execution_count = 1;
+        // One budget of re-sends to this server, the request's or the
+        // connection's, spent here and nowhere else; the routes other than the
+        // main one never re-send. A request is sent up to its budget plus one
+        // times. A rank that was not ready is waited out before each re-send;
+        // any other re-send follows at once.
+        let budget = match route {
+            Route::Main => retries.budget(self.max_retries),
+            Route::Fast | Route::Once(_) => 0,
+        };
+        // A request lost after it was written in full (no response in time,
+        // or the connection closed or reset before or while the response
+        // arrived) may have been applied, so a second copy could apply it
+        // twice: it is re-sent only where that is harmless, and otherwise
+        // fails as an HTTP error, which fails over rather than re-sending. The
+        // read-only endpoints the client itself uses are re-sent regardless.
+        let repeatable = retries.is_repeatable() || is_repeatable_endpoint(uri.path());
+        // Only on the main route: the others are never re-sent anyway, and
+        // their callers read any failure as "no answer".
+        let guard_written = matches!(route, Route::Main) && !repeatable;
+        let mut waits = 0usize;
         // A request that cannot be sent fails with its time from the first
-        // try, its retries included, and the root cause, logged at ERROR: the
+        // try, its re-sends included, and the root cause, logged at ERROR: the
         // innermost error's own text.
         let started = Instant::now();
         let submit_failed = |cause: String| {
@@ -848,7 +971,15 @@ impl HyperClient {
             error!("Giving up with an exit error after {elapsed}ms due to {cause}");
             KineticaError::Connection(format!("Error submitting endpoint <{url}> request after <{elapsed}>ms due to: {cause}"))
         };
-        let (_permit, resp) = loop {
+        let sent_in_full = |cause: String| {
+            let elapsed = started.elapsed().as_millis();
+            error!("Not re-sending endpoint <{url}> request after <{elapsed}>ms, as it was sent in full and may have been applied: {cause}");
+            KineticaError::Http(format!(
+                "Error submitting endpoint <{url}> request after <{elapsed}>ms; it was sent in full, so it is not \
+                 sent again: {cause}"
+            ))
+        };
+        for resent in 0.. {
             // Build request
             let mut builder = Request::post(uri.clone());
             for (name, value) in &headers.user {
@@ -866,7 +997,7 @@ impl HyperClient {
             if let Some(content_type) = content_type {
                 builder = builder.header("Content-type", content_type);
             }
-            let (request_body, sent) = RequestBody::tracked(body_bytes.clone());
+            let (request_body, sent, written) = RequestBody::tracked(body_bytes.clone());
             let req = builder
                 .body(request_body)
                 .map_err(|e| KineticaError::Http(format!("Failed to build request: {e}")))?;
@@ -881,85 +1012,87 @@ impl HyperClient {
             )
             .await
             .map_err(|timeout| submit_failed(timeout.message()))?;
-            let may_retry = execution_count <= max_retries;
-            let resp = match response_within(response_limit, url, send(client, req), sent).await {
-                // No response in time, retried.
-                Err(timeout) => {
-                    trace!("Retry #{execution_count} after error {timeout}");
-                    if may_retry {
-                        execution_count += 1;
-                        continue;
+
+            // One attempt: its outcome were it the last, how it may be re-sent,
+            // and why it failed
+            let (outcome, resend, failure) = match response_within(response_limit, url, send(client, req), sent).await {
+                Ok(Ok(resp)) => match read_response(resp, body_limit, url).await {
+                    Ok(raw) => match failed_reply_message(raw.status, raw.content_type.as_deref(), &raw.body) {
+                        // Succeeded
+                        None => return Ok(raw),
+                        Some(message) => {
+                            let reply = retry_rules::of_reply(raw.status, &raw.reason, message.as_deref());
+                            debug!(
+                                "Reply from {url}; response_code: {}; reason: {}; message: {message:?}; action: {reply:?}",
+                                raw.status, raw.reason
+                            );
+                            let failure = format!("{} {}: {}", raw.status, raw.reason, message.as_deref().unwrap_or(""));
+                            match reply.resend() {
+                                None | Some(Resend::Never) => return Ok(raw),
+                                Some(resend) => (Ok(raw), resend, failure),
+                            }
+                        }
+                    },
+                    // The server has begun to answer, so it has handled the
+                    // request, possibly by applying it
+                    Err(e) => {
+                        let cause = e.message();
+                        (Err(e), Resend::IfRepeatable, cause)
                     }
-                    return Err(submit_failed(timeout.message()));
-                }
+                },
                 Ok(Err(e)) => {
-                    trace!("Retry #{execution_count} after error {e}");
                     if let Some(tls) = tls_error(&e) {
                         let message = ssl_error_message(url, &tls);
                         error!("{message}");
                         return Err(KineticaError::Config(message));
                     }
-                    // A connect timeout included
-                    if may_retry {
-                        execution_count += 1;
-                        continue;
+                    let cause = root_cause(&e);
+                    if written.load(std::sync::atomic::Ordering::SeqCst) {
+                        let error = if guard_written { sent_in_full(cause.clone()) } else { submit_failed(cause.clone()) };
+                        (Err(error), Resend::IfRepeatable, cause)
+                    } else {
+                        // A connect timeout or a refused connection included
+                        (Err(submit_failed(cause.clone())), Resend::Always, cause)
                     }
-                    return Err(submit_failed(root_cause(&e)));
                 }
-                Ok(Ok(resp)) => resp,
+                // No response in time
+                Err(timeout) => {
+                    let cause = timeout.message();
+                    if written.load(std::sync::atomic::Ordering::SeqCst) {
+                        let error = if guard_written { sent_in_full(cause.clone()) } else { submit_failed(cause.clone()) };
+                        (Err(error), Resend::IfRepeatable, cause)
+                    } else {
+                        (Err(submit_failed(cause.clone())), Resend::Always, cause)
+                    }
+                }
             };
-            let status = resp.status().as_u16();
-            if may_retry && (status == 502 || status == 503) {
-                trace!("Retry #{execution_count} for status {status}");
-                execution_count += 1;
-                continue;
-            }
-            break (permit, resp);
-        };
+            drop(permit);
 
-        let status = resp.status();
-        // hyper keeps the phrase only when it is not the standard one
-        let reason = resp
-            .extensions()
-            .get::<hyper::ext::ReasonPhrase>()
-            .map(|phrase| String::from_utf8_lossy(phrase.as_bytes()).into_owned())
-            .unwrap_or_else(|| status.canonical_reason().unwrap_or("").to_string());
-        let content_type = resp
-            .headers()
-            .get(hyper::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-
-        // Read the body even on an error status: it may say what went wrong.
-        // A failure part way through is not a connection failure, so a body
-        // timeout is re-labelled too. The timeout bounds each read rather than
-        // the whole body: a large response still arriving is not cut off.
-        let mut incoming = resp.into_body();
-        let mut parts: Vec<Bytes> = Vec::new();
-        loop {
-            match within(body_limit, "the response body", url, incoming.frame()).await {
-                Err(timeout) => return Err(KineticaError::Http(timeout.to_string())),
-                Ok(None) => break,
-                Ok(Some(Err(e))) => return Err(KineticaError::Http(format!("Failed to read response: {e}"))),
-                Ok(Some(Ok(frame))) => {
-                    if let Ok(data) = frame.into_data() {
-                        parts.push(data);
-                    }
-                }
+            let may_resend = match resend {
+                Resend::Always | Resend::AfterWait => true,
+                Resend::IfRepeatable => repeatable,
+                Resend::Never => false,
+            };
+            if resent >= budget || !may_resend {
+                return outcome;
             }
+            if resend == Resend::IfRepeatable {
+                retries.note_resent_after_uncertain_failure(failure.clone());
+            }
+            if resend == Resend::AfterWait {
+                let wait = retry_rules::resend_wait(waits);
+                waits += 1;
+                warn!(
+                    "Endpoint at {url} is not ready: {failure}; re-sending in {}s (re-send {} of {budget})",
+                    wait.as_secs(),
+                    resent + 1
+                );
+                tokio::time::sleep(wait).await;
+            }
+            trace!("Retry #{} of request to {url} after: {failure}", resent + 1);
+            retries.note_resent();
         }
-        let body = match parts.len() {
-            0 => Bytes::new(),
-            1 => parts.pop().unwrap_or_default(),
-            _ => Bytes::from(parts.concat()),
-        };
-
-        Ok(RawResponse {
-            status: status.as_u16(),
-            reason,
-            content_type,
-            body,
-        })
+        unreachable!("the loop returns")
     }
 
     /// Sends a GET request and returns the response body as text.
@@ -1103,7 +1236,7 @@ pub(crate) fn snappy_compress(body: &[u8]) -> Result<Vec<u8>, KineticaError> {
 /// The headers sent with a request besides its content type.
 #[derive(Debug, Clone, Default)]
 pub struct RequestHeaders {
-    /// The caller's headers, the `User-Agent` among them.
+    /// The caller's headers, the `X-Kinetica-Client` among them.
     pub user: Vec<(String, String)>,
     /// The connection's session ID, sent as `X-Kinetica-Session`: SQL
     /// `#name` temp tables belong to the session that creates them.
@@ -1523,8 +1656,169 @@ mod connection_tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
+    /// An Avro response wrapper's start, with `status` and `message`.
+    fn wrapper(status: &str, message: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        for s in [status, message] {
+            body.extend(zigzag(s.len()));
+            body.extend_from_slice(s.as_bytes());
+        }
+        body.extend_from_slice(&[0, 0]);
+        body
+    }
+
+    fn zigzag(n: usize) -> Vec<u8> {
+        let mut value = (n as u64) << 1;
+        let mut bytes = Vec::new();
+        loop {
+            if value < 0x80 {
+                bytes.push(value as u8);
+                return bytes;
+            }
+            bytes.push((value as u8 & 0x7f) | 0x80);
+            value >>= 7;
+        }
+    }
+
+    /// A server that answers each request with the next of `replies` -- a
+    /// status line's code and reason, and an Avro body -- and then `200 OK`.
+    /// Counts requests.
+    async fn spawn_reply_server(replies: Vec<(u16, &'static str, Vec<u8>)>) -> (String, Arc<AtomicUsize>) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let replies = Arc::new(replies);
+        let (url, _) = spawn_server(move |mut stream| {
+            let (seen, replies) = (seen.clone(), replies.clone());
+            async move {
+                if !read_request(&mut stream).await {
+                    return;
+                }
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                let (status, reason, body) = replies.get(n).cloned().unwrap_or((200, "OK", wrapper("OK", "")));
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+                let _ = stream.shutdown().await;
+            }
+        })
+        .await;
+        (url, requests)
+    }
+
+    async fn post_with(client: &HyperClient, url: &str, retries: &RequestRetries) -> Result<RawResponse, KineticaError> {
+        client
+            .post_encoded_raw(url, Bytes::from_static(b"payload"), false, &RequestHeaders::default(), retries)
+            .await
+    }
+
+    // A gateway timeout is re-sent like a 502 or 503.
     #[tokio::test]
-    async fn a_connection_closed_without_a_response_is_retried() {
+    async fn a_504_is_re_sent() {
+        let (url, requests) = spawn_status_server(&[504, 504]).await;
+        let resp = post(&HyperClient::with_config(&retrying(3, 2_000)), &url).await.expect("answered");
+        assert_eq!(resp.status, 200);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+    }
+
+    // The server's message decides before its status: a 503 saying the
+    // server is offline is not re-sent, nor one whose reason phrase says so;
+    // a 503 saying something else is.
+    #[tokio::test]
+    async fn a_503_reporting_the_servers_state_is_not_re_sent() {
+        let client = HyperClient::with_config(&retrying(3, 2_000));
+        let (url, requests) =
+            spawn_reply_server(vec![(503, "Service Unavailable", wrapper("ERROR", "Kinetica is offline"))]).await;
+        assert_eq!(post(&client, &url).await.unwrap().status, 503);
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "offline");
+
+        let (url, requests) = spawn_reply_server(vec![(503, "Migrating", Vec::new())]).await;
+        assert_eq!(post(&client, &url).await.unwrap().status, 503);
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "migrating");
+
+        let (url, requests) = spawn_reply_server(vec![(503, "Service Unavailable", wrapper("ERROR", "busy"))]).await;
+        assert_eq!(post(&client, &url).await.unwrap().status, 200);
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "busy");
+    }
+
+    // A rank whose HA client is not ready is waited out, whatever the
+    // status, within the request's one budget: 1 s before the first re-send,
+    // 2 s before the next.
+    #[tokio::test]
+    async fn a_rank_not_ready_is_re_sent_after_a_wait() {
+        let not_ready = || (200, "OK", wrapper("ERROR", "[HA] Unavailable: Consumer not created"));
+        let (url, requests) = spawn_reply_server(vec![not_ready(), not_ready()]).await;
+        let started = Instant::now();
+        let retries = RequestRetries::new(2, false);
+        let resp = post_with(&HyperClient::with_config(&retrying(0, 2_000)), &url, &retries).await.unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(failed_reply_message(resp.status, resp.content_type.as_deref(), &resp.body), None, "answered");
+        assert_eq!((requests.load(Ordering::SeqCst), retries.resends()), (3, 2));
+        assert!(started.elapsed() >= Duration::from_secs(3), "waited 1 s, then 2 s: {:?}", started.elapsed());
+        assert_eq!(retries.uncertain_failure(), None, "nothing was stored");
+    }
+
+    // A budget spent on one failure is not spent again on another: a
+    // request is sent at most its budget plus one times.
+    #[tokio::test]
+    async fn every_re_send_counts_against_one_budget() {
+        let (url, requests) = spawn_reply_server(vec![
+            (503, "Service Unavailable", Vec::new()),
+            (200, "OK", wrapper("ERROR", "Unavailable: Producer not available")),
+            (504, "Gateway Timeout", Vec::new()),
+        ])
+        .await;
+        let resp = post(&HyperClient::with_config(&retrying(2, 2_000)), &url).await.unwrap();
+        assert_eq!(resp.status, 504, "the last outcome");
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+    }
+
+    // A rank that failed while handling the request may have stored part of
+    // it: it is re-sent only where a second copy is harmless, and the
+    // failure is recorded for whoever sent it.
+    #[tokio::test]
+    async fn a_rank_failure_is_re_sent_only_if_repeatable() {
+        let client = HyperClient::with_config(&retrying(3, 2_000));
+        let failed = || vec![(400, "Bad Request", wrapper("ERROR", "Rank 2 non-responsive"))];
+
+        let (url, requests) = spawn_reply_server(failed()).await;
+        let retries = RequestRetries::new(3, false);
+        assert_eq!(post_with(&client, &url, &retries).await.unwrap().status, 400);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        let (url, requests) = spawn_reply_server(failed()).await;
+        let retries = RequestRetries::new(3, true);
+        assert_eq!(post_with(&client, &url, &retries).await.unwrap().status, 200);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert!(retries.uncertain_failure().is_some_and(|f| f.contains("Rank 2 non-responsive")), "{retries:?}");
+    }
+
+    // A repeatable request (a batch into a table with a primary key) is
+    // re-sent even once written in full, within its own budget rather than
+    // the connection's, and the failure is recorded.
+    #[tokio::test]
+    async fn a_repeatable_request_hung_up_on_is_re_sent_within_its_own_budget() {
+        let client = HyperClient::with_config(&retrying(0, 2_000));
+        let (url, requests) = spawn_hanging_up_server(2).await;
+        let retries = RequestRetries::new(2, true);
+        let resp = post_with(&client, &format!("{url}insert/records"), &retries).await.expect("answered");
+        assert_eq!(resp.status, 200);
+        assert_eq!((requests.load(Ordering::SeqCst), retries.resends()), (3, 2));
+        assert!(retries.uncertain_failure().is_some(), "an earlier copy's outcome is unknown");
+
+        // Its own budget of none, though the connection's is 3
+        let client = HyperClient::with_config(&retrying(3, 2_000));
+        let (url, requests) = spawn_hanging_up_server(1).await;
+        let err = post_with(&client, &format!("{url}insert/records"), &RequestRetries::new(0, true)).await.unwrap_err();
+        assert!(matches!(err, KineticaError::Connection(_)), "{err:?}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// A server that reads each request in full, then hangs up without a
+    /// response on the first `hang_ups` and answers the rest. Counts requests.
+    async fn spawn_hanging_up_server(hang_ups: usize) -> (String, Arc<AtomicUsize>) {
         let requests = Arc::new(AtomicUsize::new(0));
         let seen = requests.clone();
         let (url, _) = spawn_server(move |mut stream| {
@@ -1533,8 +1827,7 @@ mod connection_tests {
                 if !read_request(&mut stream).await {
                     return;
                 }
-                // Hang up on the first request; answer the next.
-                if seen.fetch_add(1, Ordering::SeqCst) > 0 {
+                if seen.fetch_add(1, Ordering::SeqCst) >= hang_ups {
                     let _ = stream
                         .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
                         .await;
@@ -1543,14 +1836,37 @@ mod connection_tests {
             }
         })
         .await;
+        (url, requests)
+    }
 
-        let resp = post(&HyperClient::with_config(&retrying(5, 2_000)), &url).await.expect("answered");
+    // A request written in full and then hung up on may have been applied, so
+    // it is not sent again: an HTTP error, which fails over, not a
+    // connection failure, which would be re-sent.
+    #[tokio::test]
+    async fn a_request_hung_up_on_after_it_was_written_is_not_resent() {
+        let (url, requests) = spawn_hanging_up_server(1).await;
+        let err = post(&HyperClient::with_config(&retrying(5, 2_000)), &format!("{url}insert/records"))
+            .await
+            .expect_err("hung up on");
+        assert!(matches!(err, KineticaError::Http(ref m) if m.contains("sent in full")), "got {err:?}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "sent once");
+    }
+
+    // The client's own read-only requests are sent again: a second copy
+    // changes nothing.
+    #[tokio::test]
+    async fn a_read_only_request_hung_up_on_is_resent() {
+        let (url, requests) = spawn_hanging_up_server(1).await;
+        let resp = post(&HyperClient::with_config(&retrying(5, 2_000)), &format!("{url}gpudb-0/show/table"))
+            .await
+            .expect("answered");
         assert_eq!(resp.status, 200);
         assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test]
-    async fn a_response_timeout_is_retried() {
+    /// A server that reads each request in full and never answers. Counts
+    /// requests.
+    async fn spawn_silent_server() -> (String, Arc<AtomicUsize>) {
         let requests = Arc::new(AtomicUsize::new(0));
         let seen = requests.clone();
         let (url, _) = spawn_server(move |mut stream| {
@@ -1563,8 +1879,30 @@ mod connection_tests {
             }
         })
         .await;
+        (url, requests)
+    }
 
-        let err = post(&HyperClient::with_config(&retrying(2, 150)), &url).await.expect_err("silent");
+    // No response in time to a request written in full: not sent again.
+    #[tokio::test]
+    async fn a_response_timeout_after_the_request_was_written_is_not_resent() {
+        let (url, requests) = spawn_silent_server().await;
+        let err = post(&HyperClient::with_config(&retrying(2, 150)), &format!("{url}execute/sql"))
+            .await
+            .expect_err("silent");
+        assert!(matches!(err, KineticaError::Http(ref m) if m.contains("sent in full")), "got {err:?}");
+        assert!(crate::test_wait::eventually(|| requests.load(Ordering::SeqCst) == 1).await);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "sent once");
+    }
+
+    // A read-only request that gets no response in time is retried, and then
+    // fails as a connection failure.
+    #[tokio::test]
+    async fn a_read_only_request_timing_out_is_retried() {
+        let (url, requests) = spawn_silent_server().await;
+        let err = post(&HyperClient::with_config(&retrying(2, 150)), &format!("{url}show/system/properties"))
+            .await
+            .expect_err("silent");
         assert!(matches!(err, KineticaError::Connection(_)), "got {err:?}");
         // The server counts a request once it has read it, which can come
         // after the client has given up on the last one
@@ -1573,6 +1911,17 @@ mod connection_tests {
             "the first attempt and two retries, not {}",
             requests.load(Ordering::SeqCst)
         );
+    }
+
+    #[test]
+    fn the_read_only_endpoints_are_repeatable() {
+        for path in ["/show/table", "/gpudb-0/show/types", "/admin/show/shards", "/show/system/properties/",
+                     "/show/system/status", "/show/files", "/show/directories"] {
+            assert!(is_repeatable_endpoint(path), "{path}");
+        }
+        for path in ["/insert/records", "/execute/sql", "/show/table/x", "/", ""] {
+            assert!(!is_repeatable_endpoint(path), "{path}");
+        }
     }
 
     /// Reads one request's head, so the server can answer it.
@@ -1640,11 +1989,12 @@ mod connection_tests {
     }
 
     // The caller's headers, the session, the HA sync mode, the authorization,
-    // then the content type; no `Connection` header of its own.
+    // then the content type; no `Connection` or `User-Agent` header of its
+    // own.
     #[tokio::test]
     async fn requests_carry_the_expected_headers() {
         let headers = sent_headers(RequestHeaders {
-            user: vec![("X-Custom".to_string(), "1".to_string()), ("User-Agent".to_string(), "ua/1".to_string())],
+            user: vec![("X-Custom".to_string(), "1".to_string()), ("X-Kinetica-Client".to_string(), "c/1".to_string())],
             session: Some("s-1".to_string()),
             ha_sync_mode: Some("REPL_SYNC".to_string()),
             authorization: Some("Bearer t".to_string()),
@@ -1659,7 +2009,7 @@ mod connection_tests {
             ours,
             [
                 "x-custom: 1",
-                "user-agent: ua/1",
+                "x-kinetica-client: c/1",
                 "x-kinetica-session: s-1",
                 "x-kinetica-group: repl_sync",
                 "authorization: bearer t",
@@ -2047,7 +2397,7 @@ mod connection_tests {
         let config = HttpClientConfig::default();
         assert_eq!(config.request_timeout, None, "no request timeout by default");
         assert_eq!(config.connect_timeout, Some(Duration::from_millis(5_000)));
-        assert_eq!(config.max_retries, 5, "five retries by default");
+        assert_eq!(config.max_retries, 3, "three retries by default");
     }
 }
 

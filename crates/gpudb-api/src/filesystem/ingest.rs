@@ -17,14 +17,21 @@ use super::uploader::FileUploader;
 use super::{KIFS_PATH_PREFIX, KIFS_PATH_SEPARATOR, REMOTE_USER_HOME_DIR_PREFIX};
 
 /// How the server handles a record it cannot insert.
+///
+/// The server may take more values in a later release, so a `match` over
+/// this enum needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ErrorHandlingMode {
     /// Insert what can be, setting what cannot to null
     Permissive,
-    /// Skip a record that cannot be inserted
+    /// Skip a record that cannot be inserted. Deprecated on the server: an
+    /// alias for [`Self::Skip`].
     IgnoreBadRecords,
     /// Stop at the first record that cannot be inserted
     Abort,
+    /// Skip a malformed record
+    Skip,
 }
 
 impl ErrorHandlingMode {
@@ -34,17 +41,36 @@ impl ErrorHandlingMode {
             Self::Permissive => "permissive",
             Self::IgnoreBadRecords => "ignore_bad_records",
             Self::Abort => "abort",
+            Self::Skip => "skip",
         }
     }
 
-    /// The default mode's name.
+    /// The mode the server uses when none is given: [`Self::Abort`].
+    pub fn get_default() -> Self {
+        Self::Abort
+    }
+
+    /// The name of [`Self::Permissive`], which is not the server's default;
+    /// that is [`Self::Abort`].
+    #[deprecated(since = "7.2.4", note = "use `ErrorHandlingMode::get_default()`, which returns the server's default")]
     pub fn default_mode(&self) -> &'static str {
         Self::Permissive.as_str()
     }
 }
 
+impl Default for ErrorHandlingMode {
+    /// The server's default; see [`ErrorHandlingMode::get_default`].
+    fn default() -> Self {
+        Self::get_default()
+    }
+}
+
 /// The type of the files ingested.
+///
+/// The server may take more values in a later release, so a `match` over
+/// this enum needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FileType {
     /// Delimited text, such as CSV
     DelimitedText,
@@ -54,6 +80,10 @@ pub enum FileType {
     Json,
     /// Shapefile
     Shapefile,
+    /// Avro
+    Avro,
+    /// Esri file geodatabase
+    Gdb,
 }
 
 impl FileType {
@@ -64,17 +94,38 @@ impl FileType {
             Self::Parquet => "parquet",
             Self::Json => "json",
             Self::Shapefile => "shapefile",
+            Self::Avro => "avro",
+            Self::Gdb => "gdb",
         }
     }
 
-    /// The default type's name.
+    /// The file type the server assumes when none is given and none can be
+    /// told from the file's extension: [`Self::DelimitedText`].
+    pub fn get_default() -> Self {
+        Self::DelimitedText
+    }
+
+    /// The name of the default file type; misnamed, as it has nothing to do
+    /// with partitioning.
+    #[deprecated(since = "7.2.4", note = "use `FileType::get_default()`")]
     pub fn default_partition_type(&self) -> &'static str {
         Self::DelimitedText.as_str()
     }
 }
 
+impl Default for FileType {
+    /// The server's default; see [`FileType::get_default`].
+    fn default() -> Self {
+        Self::get_default()
+    }
+}
+
 /// How a table created for the ingest is partitioned.
+///
+/// The server may take more values in a later release, so a `match` over
+/// this enum needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PartitionType {
     /// By ranges of values
     Range,
@@ -84,16 +135,21 @@ pub enum PartitionType {
     List,
     /// By hash
     Hash,
+    /// By series
+    Series,
 }
 
 impl PartitionType {
-    /// The type's name, as the server takes it.
+    /// The type's name, in lowercase. The server documents the values in
+    /// uppercase, which is how [`TableCreationOptions::set_partition_type`]
+    /// sends them.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Range => "range",
             Self::Interval => "interval",
             Self::List => "list",
             Self::Hash => "hash",
+            Self::Series => "series",
         }
     }
 
@@ -111,7 +167,11 @@ impl std::fmt::Display for PartitionType {
 }
 
 /// How the server infers the types of the columns of a table it creates.
+///
+/// The server may take more values in a later release, so a `match` over
+/// this enum needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TypeInferenceMode {
     /// Scan all the data for the best types
     Accuracy,
@@ -128,9 +188,24 @@ impl TypeInferenceMode {
         }
     }
 
-    /// The default mode's name.
+    /// The mode the server uses when none is given: [`Self::Accuracy`].
+    pub fn get_default() -> Self {
+        Self::Accuracy
+    }
+
+    /// The name of [`Self::Speed`], which is not the server's default; that
+    /// is [`Self::Accuracy`]. Misnamed, as it has nothing to do with
+    /// partitioning.
+    #[deprecated(since = "7.2.4", note = "use `TypeInferenceMode::get_default()`, which returns the server's default")]
     pub fn default_partition_type(&self) -> &'static str {
         Self::Speed.as_str()
+    }
+}
+
+impl Default for TypeInferenceMode {
+    /// The server's default; see [`TypeInferenceMode::get_default`].
+    fn default() -> Self {
+        Self::get_default()
     }
 }
 
@@ -308,7 +383,8 @@ impl IngestOptions {
         self.columns_to_load.as_deref()
     }
 
-    /// Sets the columns to load, sent as a JSON array, each once.
+    /// Sets the columns to load, each once, in the order given (the server
+    /// reads them by position), sent as a comma-separated list.
     ///
     /// # Errors
     ///
@@ -324,7 +400,7 @@ impl IngestOptions {
         }
         self.options.insert(
             ingest_option::COLUMNS_TO_LOAD,
-            serde_json::to_string(&columns_to_load).expect("strings are JSON"),
+            columns_to_load.join(","),
         );
         self.columns_to_load = Some(columns_to_load);
         Ok(self)
@@ -334,7 +410,7 @@ impl IngestOptions {
         self.columns_to_skip.as_deref()
     }
 
-    /// Sets the columns to skip, sent as a JSON array, each once.
+    /// Sets the columns to skip, each once, sent as a comma-separated list.
     ///
     /// # Errors
     ///
@@ -350,7 +426,7 @@ impl IngestOptions {
         }
         self.options.insert(
             ingest_option::COLUMNS_TO_SKIP,
-            serde_json::to_string(&columns_to_skip).expect("strings are JSON"),
+            columns_to_skip.join(","),
         );
         self.columns_to_skip = Some(columns_to_skip);
         Ok(self)
@@ -593,13 +669,14 @@ impl TableCreationOptions {
         self.foreign_keys.as_deref()
     }
 
-    /// Sets the foreign keys, sent joined by commas; an empty list is
+    /// Sets the foreign keys, sent separated by semicolons, as the server
+    /// expects (each key's own column lists use commas); an empty list is
     /// ignored, with a warning.
     pub fn set_foreign_keys(&mut self, foreign_keys: Vec<String>) -> &mut Self {
         if foreign_keys.is_empty() {
             warn!("FOREIGN_KEYS cannot be empty; value not set");
         } else {
-            self.options.insert(table_creation_option::FOREIGN_KEYS, foreign_keys.join(","));
+            self.options.insert(table_creation_option::FOREIGN_KEYS, foreign_keys.join(";"));
             self.foreign_keys = Some(foreign_keys);
         }
         self
@@ -624,9 +701,11 @@ impl TableCreationOptions {
         self.partition_type
     }
 
+    /// Sets the partition type, sent in uppercase, as the server documents
+    /// it.
     pub fn set_partition_type(&mut self, partition_type: PartitionType) -> &mut Self {
         self.partition_type = Some(partition_type);
-        self.options.insert(table_creation_option::PARTITION_TYPE, partition_type.as_str().to_string());
+        self.options.insert(table_creation_option::PARTITION_TYPE, partition_type.as_str().to_uppercase());
         self
     }
 
@@ -864,17 +943,19 @@ impl FileIngestor {
         );
 
         let outcome = async {
-            let (local_files, remote_files) = uploader.resolve().await?;
-            uploader.upload_resolved(&local_files, &remote_files).await?;
+            let resolved = uploader.resolve().await?;
+            // Two files staged at the same path would overwrite each other,
+            // and the last one uploaded be ingested twice
+            if !resolved.files_with_duplicate_names.is_empty() {
+                return Err(KineticaError::Config(format!(
+                    "Files with the same name cannot be ingested together: [{}]; nothing was uploaded",
+                    resolved.files_with_duplicate_names.join(", ")
+                )));
+            }
+            uploader.upload_resolved(&resolved.local_files, &resolved.remote_files).await?;
             // Each file once, in the order first found: a file two of the
-            // names given both match is uploaded once, and must be loaded
-            // once.
-            let mut named = std::collections::HashSet::new();
-            let filepaths = remote_files
-                .iter()
-                .filter(|remote| named.insert(remote.as_str()))
-                .map(|remote| format!("{KIFS_PATH_PREFIX}{remote}"))
-                .collect();
+            // names given both match was resolved once
+            let filepaths = resolved.remote_files.iter().map(|remote| format!("{KIFS_PATH_PREFIX}{remote}")).collect();
             let request = InsertRecordsFromFilesRequest {
                 table_name: self.table_name.clone(),
                 filepaths,
@@ -948,7 +1029,7 @@ mod tests {
             ("text_has_header", "true"),
             ("type_inference_mode", "accuracy"),
             ("batch_size", "1000"),
-            ("columns_to_load", r#"["a","c"]"#),
+            ("columns_to_load", "a,c"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1102,6 +1183,32 @@ mod tests {
         assert_eq!(uploaded, [format!("{staging}/a.csv"), format!("{staging}/b.csv")]);
     }
 
+    /// Two files that would be staged at one path are refused before
+    /// anything is uploaded: one would overwrite the other, and be ingested
+    /// twice.
+    #[tokio::test]
+    async fn files_with_the_same_name_are_not_ingested_together() {
+        let (_server, handler, asked) = server("127.0.0.249", false).await;
+        let dir = TempDir::new("ingest_same_name");
+        dir.write("a/x.csv", b"1");
+        dir.write("b/x.csv", b"2");
+
+        let err = handler
+            .ingest(vec![format!("{}/a/x.csv", dir.str()), format!("{}/b/*.csv", dir.str())], "t", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "API error: Files with the same name cannot be ingested together: [{0}/a/x.csv, {0}/b/x.csv]; \
+                 nothing was uploaded",
+                dir.str()
+            )
+        );
+        let asked = asked.lock();
+        assert!(asked.uploaded.is_empty() && asked.ingested.is_empty(), "nothing was uploaded or ingested");
+    }
+
     /// A failed insert is the ingest's error, and the staging directory is
     /// deleted all the same.
     #[tokio::test]
@@ -1136,10 +1243,54 @@ mod tests {
         let sent = options.options();
         assert_eq!(sent["is_replicated"], "true");
         assert_eq!(sent["no_error_if_exists"], "false");
-        assert_eq!(sent["partition_type"], "hash");
+        assert_eq!(sent["partition_type"], "HASH", "in uppercase, as the server documents it");
         assert_eq!(sent["partition_keys"], "x,y");
         assert_eq!(sent["ttl"], "5");
         assert_eq!(PartitionType::Interval.to_string(), "interval");
+        options.set_partition_type(PartitionType::Series);
+        assert_eq!(options.options()["partition_type"], "SERIES");
+    }
+
+    // Each enum's default is the server's, and the new values have the names
+    // the server takes.
+    #[test]
+    #[allow(deprecated)]
+    fn the_ingest_enums_default_as_the_server_does() {
+        assert_eq!(ErrorHandlingMode::get_default(), ErrorHandlingMode::Abort);
+        assert_eq!(ErrorHandlingMode::default(), ErrorHandlingMode::Abort);
+        assert_eq!(FileType::get_default(), FileType::DelimitedText);
+        assert_eq!(TypeInferenceMode::get_default(), TypeInferenceMode::Accuracy);
+        assert_eq!(
+            [ErrorHandlingMode::Skip.as_str(), FileType::Avro.as_str(), FileType::Gdb.as_str(), PartitionType::Series.as_str()],
+            ["skip", "avro", "gdb", "series"]
+        );
+        // The deprecated names keep what they returned
+        assert_eq!(ErrorHandlingMode::Abort.default_mode(), "permissive");
         assert_eq!(FileType::Json.default_partition_type(), "delimited_text");
+        assert_eq!(TypeInferenceMode::Accuracy.default_partition_type(), "speed");
+    }
+
+    // The columns to skip are sent as a comma-separated list, in the order
+    // given, each once.
+    #[test]
+    fn columns_to_skip_are_sent_as_a_list() {
+        let mut options = IngestOptions::new();
+        options.set_columns_to_skip(vec!["z".into(), "a".into(), "z".into()]).unwrap();
+        assert_eq!(options.options().get("columns_to_skip").map(String::as_str), Some("z,a"));
+    }
+
+    // Foreign keys are separated by semicolons; a key's own column lists keep
+    // their commas.
+    #[test]
+    fn foreign_keys_are_separated_by_semicolons() {
+        let mut options = TableCreationOptions::new();
+        options.set_foreign_keys(vec![
+            "(a, b) references t1(x, y)".into(),
+            "c references t2(z) as fk_c".into(),
+        ]);
+        assert_eq!(
+            options.options().get("foreign_keys").map(String::as_str),
+            Some("(a, b) references t1(x, y);c references t2(z) as fk_c")
+        );
     }
 }

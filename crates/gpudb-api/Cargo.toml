@@ -2,7 +2,7 @@
 name = "gpudb-api"
 # Written from the repository's VERSION by the schema-processing script in
 # gpudb-generators: MAJOR.MINOR.REVISION, the REVISION being the crate's own
-version = "7.2.3"
+version = "7.2.4"
 edition = "2021"
 # The oldest toolchain the crate builds with
 rust-version = "1.88"

@@ -199,6 +199,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 use arc_swap::ArcSwap;
 use crate::gpudb::MultiHeadSnapshot;
+use crate::retry_rules::RequestRetries;
 use crate::text_format::equals_ignore_case;
 use crate::json_records::{json_kind, json_text, type_mismatch, JsonOptions};
 use crate::json_utils;
@@ -296,8 +297,60 @@ impl BatchRequest {
 struct BatchOutcome {
     inserted: i64,
     updated: i64,
-    /// The `info` of an Avro insert; a JSON insert's is not read.
+    /// The `info` of an Avro insert; a JSON insert's is not read, but for
+    /// its warnings.
     info: Option<HashMap<String, String>>,
+    /// The warnings in a JSON insert's `data.info`, read only for the
+    /// primary-key collisions a re-sent batch met.
+    json_warnings: Vec<String>,
+}
+
+/// The warnings (`warning_*`, ignoring case) in the `info` of a JSON
+/// insert's `data`, in key order.
+fn json_reply_warnings(response: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    let Some(serde_json::Value::Object(info)) = response.get("data").and_then(|data| data.get("info")) else {
+        return Vec::new();
+    };
+    let mut warnings: Vec<(&String, String)> = info
+        .iter()
+        .filter(|(key, _)| key.to_lowercase().starts_with("warning_"))
+        .map(|(key, value)| (key, json_text(value)))
+        .collect();
+    warnings.sort_by(|a, b| a.0.cmp(b.0));
+    warnings.into_iter().map(|(_, warning)| warning).collect()
+}
+
+/// The warnings for the primary-key collisions a batch met when it was
+/// re-sent after `uncertain_failure`, a failure that leaves an earlier copy's
+/// outcome unknown. The earlier copy may have stored those records, so they
+/// are reported as possibly stored rather than as rejected: each record the
+/// reply names, by its index in the batch, or the batch as a whole where it
+/// names none. The per-record collisions are removed from `errors` and the
+/// batch warnings from `warnings`. Nothing is, and no warning is returned,
+/// where the batch was not re-sent so.
+fn possibly_stored(
+    uncertain_failure: Option<&str>,
+    errors: &mut Vec<(Option<usize>, String)>,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let Some(failure) = uncertain_failure else {
+        return Vec::new();
+    };
+    let note = format!("may already have been stored by an earlier copy of the batch, which was re-sent after: {failure}");
+    let mut possibly_stored = Vec::new();
+    errors.retain(|(index, message)| match index {
+        Some(index) if crate::retry_rules::is_primary_key_collision(message) => {
+            possibly_stored.push(format!("Record {index} {note}"));
+            false
+        }
+        _ => true,
+    });
+    let before = warnings.len();
+    warnings.retain(|warning| !crate::retry_rules::is_primary_key_collision(warning));
+    if warnings.len() < before {
+        possibly_stored.push(format!("Records the server reported as already existing {note}"));
+    }
+    possibly_stored
 }
 
 /// Reads the answer to a JSON batch: a `status` of `OK`, in any case, is
@@ -468,12 +521,18 @@ pub struct BulkInserterOptions {
     /// Options for controlling automatic/timed flush behavior.
     pub flush_options: FlushOptions,
 
-    /// Maximum number of retries for failed insertions.
-    /// Default is 3.
+    /// How many times a batch is sent again to its worker before it fails
+    /// over. Default is 7.
     ///
-    /// This counts retries after the first attempt (0 means one attempt),
-    /// only connection failures are retried, and the count starts again on
-    /// another cluster after an HA failover.
+    /// This is the batch's one budget of re-sends, in place of the
+    /// connection's [`KineticaOptions::max_retries`](crate::KineticaOptions::max_retries),
+    /// not in addition to it; 0 means one attempt. A batch is re-sent when
+    /// sending it failed before it was written in full, when the rank's HA
+    /// client is not ready yet (after a wait), or when the server answers
+    /// `502`, `503` or `504` without reporting its state; into a table with a
+    /// primary key, also when its first copy's outcome is unknown (see
+    /// [`BulkInserter::drain_warnings`]). The count starts again on another
+    /// cluster after an HA failover.
     pub max_retries: usize,
 
     /// Optional worker list for multi-head ingest.
@@ -676,8 +735,8 @@ impl BulkInserterOptions {
     }
 }
 
-/// Default number of times insertions will be re-attempted.
-const DEFAULT_INSERTION_RETRY_COUNT: usize = 3;
+/// Default number of times a batch is sent again to the same worker.
+const DEFAULT_INSERTION_RETRY_COUNT: usize = 7;
 
 
 // ============================================================================
@@ -732,7 +791,7 @@ pub struct BatchInsertionResult {
     pub network_time_ms: f64,
     /// Total time for the batch (milliseconds)
     pub total_time_ms: f64,
-    /// Retry attempt number (0 = first attempt)
+    /// How many times the batch was re-sent to its worker (0 = sent once)
     pub attempt: usize,
 }
 
@@ -1040,13 +1099,22 @@ fn record_messages_from_info(
     (errors, warnings.into_iter().map(|(_, v)| v.clone()).collect())
 }
 
-/// Whether an error calls for a retry or an HA failover: a server exit or a
-/// connection failure.
+/// Whether a batch's failure fails over to another cluster, its re-sends to
+/// this worker spent: a connection failure, a reply that reports the
+/// server's state or that the HTTP layer re-sent until its budget ran out
+/// (an exit), or a batch that may have been applied (an HTTP error, such as
+/// one written in full whose response never came, or whose response could
+/// not be read). Any other failure, such as a server-side data error, is the
+/// batch's own, and another cluster would meet it again.
+fn is_failover_trigger(error: &KineticaError) -> bool {
+    matches!(error, KineticaError::Connection(_) | KineticaError::Exit(_) | KineticaError::Http(_))
+}
+
+/// Whether a failure to read the shard mapping is an outage, a server exit or
+/// a connection failure, to be retried by a later update rather than fail.
 ///
 /// `Connection` covers both an unreachable server and the connection
 /// failure the client reports once its own failover has run out.
-/// `Http` is deliberately not included: the server may have applied the
-/// request, so it is not retried here.
 fn is_connection_error(error: &KineticaError) -> bool {
     matches!(error, KineticaError::Connection(_) | KineticaError::Exit(_))
 }
@@ -1136,13 +1204,20 @@ pub struct BulkInserter<T> {
     /// The timed flush task, while one is scheduled.
     timed_flush_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 
-    /// Maximum number of retries for failed insertions
+    /// A batch's budget of re-sends to its worker; see
+    /// [`BulkInserterOptions::max_retries`].
     max_retries: AtomicUsize,
 
     /// Whether a queue's batches are sent in the order they were dispatched,
     /// one at a time: for a table with a primary key, where two batches
     /// holding one key must reach the server in order (see `BatchOrder`).
     ordered_batches: bool,
+
+    /// Whether the table has a primary key, which makes a second copy of a
+    /// batch harmless: the server skips a record whose key is already
+    /// stored, so a batch whose first copy's outcome is unknown can be sent
+    /// again.
+    table_has_primary_key: bool,
 
     /// Whether return_individual_errors is set without allow_partial_batch
     /// (requires special error handling)
@@ -1552,6 +1627,10 @@ impl<T: Serialize + ShardKeyExtractor + Send + Sync + 'static> BulkInserter<T> {
             .columns
             .iter()
             .any(|column| column.properties.iter().any(|p| p == "primary_key"));
+        let table_has_primary_key = table_resp
+            .properties
+            .first()
+            .is_some_and(|columns| columns.values().any(|properties| properties.iter().any(|p| p == "primary_key")));
         debug!("Built RecordKeyBuilder with {} shard columns, buffer size {} bytes",
                key_builder.shard_indices.len(), key_builder.buffer_size);
         if !key_builder.shard_indices.is_empty() {
@@ -1672,6 +1751,7 @@ impl<T: Serialize + ShardKeyExtractor + Send + Sync + 'static> BulkInserter<T> {
             timed_flush_task: Mutex::new(None),
             max_retries: AtomicUsize::new(options.max_retries),
             ordered_batches,
+            table_has_primary_key,
             return_individual_errors,
             simulate_error_mode: AtomicBool::new(false),
             count_inserted: count_inserted.clone(),
@@ -2268,7 +2348,7 @@ impl<T: Serialize + ShardKeyExtractor + Send + Sync + 'static> BulkInserter<T> {
     }
 
     /// Internal method using serde_avro_fast for encoding.
-    /// This method handles retries with the configured max_retries.
+    /// The batch is re-sent within the configured max_retries.
     /// Also invokes batch listener callbacks and queues errors for async handling.
     /// Includes HA failover support for connection errors.
     async fn do_insert(
@@ -2407,158 +2487,168 @@ impl<T: Serialize + ShardKeyExtractor + Send + Sync + 'static> BulkInserter<T> {
 
         // How a batch is retried:
         //
-        // - Only a connection failure or an exit is retried. Anything else,
-        //   such as a server-side data error, fails the batch at once.
-        // - `max_retries` counts retries after the first attempt, so 0 means
-        //   one attempt.
-        // - Retries are immediate, with no back-off, except after a rank
-        //   refused the batch because its HA client is not ready: that
-        //   clears within seconds, so each such retry first waits 1 s,
-        //   doubling to at most 8 s. Any other brief outage can use up the
-        //   retries in quick succession before a failover is tried.
-        // - When they run out, a single cluster gives up. Otherwise the
-        //   inserter fails over and starts again on the new cluster with the
-        //   full retry count. That ends when the failover walk has tried every
-        //   cluster in the ring and reports HA unavailable.
-        let mut attempt = 0usize;
-        let mut retries_left = max_retries;
-        // Retries after a rank was not ready, which set the next wait
-        let mut not_ready_resends = 0usize;
+        // - It has one budget of re-sends to its worker, the inserter's own
+        //   `max_retries` (0 means one attempt), spent by the HTTP layer as
+        //   for any request: a send that failed before the batch was written
+        //   in full, a rank whose HA client is not ready (after a wait of 1 s,
+        //   doubling to at most 8 s), or a 502, 503 or 504 that does not
+        //   report the server's state. Nothing here sends it again.
+        // - A batch whose first copy's outcome is unknown (written in full and
+        //   then lost, or met by a rank failing while handling it) is re-sent
+        //   only into a table with a primary key, where the server skips a
+        //   record whose key is already stored. The collisions the re-sent
+        //   copy meets are reported as records that may already have been
+        //   stored. Into any other table, it fails over instead.
+        // - A failure that a re-send cannot get past, or that is left once the
+        //   budget is spent, fails over: a connection failure, a reply that
+        //   reports the server's state, or one that may have been applied.
+        //   A single cluster gives up. Otherwise the inserter fails over and
+        //   re-routes the records, each new batch with a full budget. That
+        //   ends when the failover walk has tried every cluster in the ring
+        //   and reports HA unavailable.
+        // - Anything else, such as a server-side data error, fails the batch
+        //   at once.
+        let retries = RequestRetries::new(max_retries, self.table_has_primary_key);
 
-        let failure = loop {
-            match self.submit_batch(&current_worker_url, &req, record_count).await {
-                Ok(outcome) => {
-                    let network_duration = network_start.elapsed();
-                    let batch_duration = batch_start.elapsed();
+        let failure = match self.submit_batch(&current_worker_url, &req, record_count, &retries).await {
+            Ok(outcome) => {
+                let network_duration = network_start.elapsed();
+                let batch_duration = batch_start.elapsed();
 
-                    // Track inserted and updated counts separately
-                    let (inserted, updated) = (outcome.inserted, outcome.updated);
-                    self.count_inserted.fetch_add(inserted, Ordering::Relaxed);
-                    self.count_updated.fetch_add(updated, Ordering::Relaxed);
+                // Track inserted and updated counts separately
+                let (inserted, updated) = (outcome.inserted, outcome.updated);
+                self.count_inserted.fetch_add(inserted, Ordering::Relaxed);
+                self.count_updated.fetch_add(updated, Ordering::Relaxed);
 
-                    if let Some(info) = &outcome.info {
-                        self.gather_record_errors(&current_worker_url, info, req.encode_failures(), &records);
-                    }
-
-                    trace!("Batch complete: sent={} inserted={} updated={} encode={:.1}ms network={:.1}ms total={:.1}ms worker={}",
-                           record_count, inserted, updated,
-                           encode_duration.as_secs_f64() * 1000.0,
-                           network_duration.as_secs_f64() * 1000.0,
-                           batch_duration.as_secs_f64() * 1000.0,
-                           worker_idx);
-
-                    // Notify batch listener of success
-                    self.notify_batch_success(
-                        &current_worker_url, record_count, inserted, updated,
-                        BatchTimings { encode: encode_duration, network: network_duration, total: batch_duration },
-                        attempt,
+                let uncertain_failure = retries.uncertain_failure();
+                if let Some(info) = &outcome.info {
+                    self.gather_record_errors(
+                        &current_worker_url,
+                        info,
+                        req.encode_failures(),
+                        &records,
+                        uncertain_failure.as_deref(),
                     );
+                }
+                let mut json_warnings = outcome.json_warnings;
+                for warning in possibly_stored(uncertain_failure.as_deref(), &mut Vec::new(), &mut json_warnings) {
+                    warn!("{warning}");
+                    self.queue_warning(warning);
+                }
 
-                    return_to_pool(&self.batch_pool, records);
+                trace!("Batch complete: sent={} inserted={} updated={} encode={:.1}ms network={:.1}ms total={:.1}ms worker={}",
+                       record_count, inserted, updated,
+                       encode_duration.as_secs_f64() * 1000.0,
+                       network_duration.as_secs_f64() * 1000.0,
+                       batch_duration.as_secs_f64() * 1000.0,
+                       worker_idx);
 
-                    // The server accepted the batch but rerouted it: shard
-                    // rebalancing is under way and our mapping is stale, so
-                    // refresh it, and rebuild the worker queues, before routing
-                    // more records. The queues are rebuilt, not only the
-                    // mapping: a rebalance can add or remove ranks, and a
-                    // mapping naming a rank with no queue refuses every record
-                    // bound for it. The
-                    // batch itself succeeded, so a failed refresh is logged and
-                    // left for the next batch rather than turning a successful
-                    // insert into an error.
-                    if outcome.info.as_ref().is_some_and(crate::gpudb::is_data_rerouted) {
-                        debug!(
-                            "Server reported rerouted data for table '{}'; refreshing shard mapping",
+                // Notify batch listener of success
+                self.notify_batch_success(
+                    &current_worker_url, record_count, inserted, updated,
+                    BatchTimings { encode: encode_duration, network: network_duration, total: batch_duration },
+                    retries.resends(),
+                );
+
+                return_to_pool(&self.batch_pool, records);
+
+                // The server accepted the batch but rerouted it: shard
+                // rebalancing is under way and our mapping is stale, so
+                // refresh it, and rebuild the worker queues, before routing
+                // more records. The queues are rebuilt, not only the
+                // mapping: a rebalance can add or remove ranks, and a
+                // mapping naming a rank with no queue refuses every record
+                // bound for it. The
+                // batch itself succeeded, so a failed refresh is logged and
+                // left for the next batch rather than turning a successful
+                // insert into an error.
+                if outcome.info.as_ref().is_some_and(crate::gpudb::is_data_rerouted) {
+                    debug!(
+                        "Server reported rerouted data for table '{}'; refreshing shard mapping",
+                        self.table_name
+                    );
+                    if let Err(e) = self.update_worker_queues(true).await {
+                        // Surfaced to the caller as well as logged: the
+                        // batch succeeded, so this is not an error, but it
+                        // means the mapping in force is known-stale and the
+                        // caller may want to know.
+                        let message = format!(
+                            "Failed to refresh shard mapping for table '{}' after \
+                             the server reported rerouted data: {e}",
                             self.table_name
                         );
-                        if let Err(e) = self.update_worker_queues(true).await {
-                            // Surfaced to the caller as well as logged: the
-                            // batch succeeded, so this is not an error, but it
-                            // means the mapping in force is known-stale and the
-                            // caller may want to know.
-                            let message = format!(
-                                "Failed to refresh shard mapping for table '{}' after \
-                                 the server reported rerouted data: {e}",
-                                self.table_name
-                            );
-                            warn!("{message}");
-                            self.queue_warning(message);
-                        }
+                        warn!("{message}");
+                        self.queue_warning(message);
                     }
-
-                    return Ok(());
                 }
-                Err(e) if !is_connection_error(&e) => {
-                    warn!("Batch insert to {current_worker_url} failed, not retrying: {e}");
-                    break e;
-                }
-                Err(e) => {
-                    warn!("Batch insert attempt {} to {current_worker_url} failed: {e}", attempt + 1);
 
-                    if retries_left > 0 {
-                        if crate::gpudb::is_rank_not_ready(&e) {
-                            let wait = crate::gpudb::rank_not_ready_wait(not_ready_resends);
-                            not_ready_resends += 1;
-                            debug!("Rank at {current_worker_url} is not ready; retrying the batch in {}s", wait.as_secs());
-                            tokio::time::sleep(wait).await;
-                        }
-                        retries_left -= 1;
-                        attempt += 1;
-                        continue;
-                    }
-
-                    if self.db_ha_ring_size <= 1 {
-                        break KineticaError::caused(
-                            format!(
-                                "Insertion failed; ran out of retries.  Original causes encountered by workers: {}",
-                                original_causes(&current_worker_url, &e)
-                            ),
-                            e,
-                        );
-                    }
-
-                    debug!("Retries exhausted after a connection failure; attempting HA failover...");
-                    match self.handle_connection_error(
-                        &e,
-                        &current_worker_url,
-                        current_cluster_switch_count,
-                    ).await {
-                        Ok(()) => {
-                            // After a failover, rebuild the worker queues for
-                            // the cluster now in use, failing the batch with
-                            // the rebuild's own message if that fails...
-                            debug!("Before calling update_worker_queues()");
-                            if let Err(rebuild_err) = self.update_worker_queues(true).await {
+                return Ok(());
+            }
+            Err(e) if !is_failover_trigger(&e) => {
+                warn!("Batch insert to {current_worker_url} failed, not retrying: {e}");
+                e
+            }
+            // A batch that may have been applied, on a single cluster, fails
+            // with its own error
+            Err(e @ KineticaError::Http(_)) if self.db_ha_ring_size <= 1 => e,
+            Err(e) if self.db_ha_ring_size <= 1 => {
+                warn!("Batch insert to {current_worker_url} failed after {} re-send(s): {e}", retries.resends());
+                KineticaError::caused(
+                    format!(
+                        "Insertion failed; ran out of retries.  Original causes encountered by workers: {}",
+                        original_causes(&current_worker_url, &e)
+                    ),
+                    e,
+                )
+            }
+            Err(e) => {
+                warn!("Batch insert to {current_worker_url} failed after {} re-send(s): {e}", retries.resends());
+                debug!("Attempting HA failover...");
+                match self.handle_connection_error(
+                    &e,
+                    &current_worker_url,
+                    current_cluster_switch_count,
+                ).await {
+                    Ok(()) => {
+                        // After a failover, rebuild the worker queues for
+                        // the cluster now in use, failing the batch with
+                        // the rebuild's own message if that fails...
+                        debug!("Before calling update_worker_queues()");
+                        match self.update_worker_queues(true).await {
+                            Err(rebuild_err) => {
                                 debug!("update_worker_queues() failed with error: {}", rebuild_err.message());
-                                break rebuild_err;
+                                rebuild_err
                             }
                             // ...then re-insert the failed records, routing
                             // each of them again: the new cluster's ranks and
                             // shard mapping decide where it goes, not this
                             // batch's old worker index. They go out as batches
                             // of their own, each with the full retry count.
-                            debug!("HA failover completed; re-routing the batch's {record_count} record(s)");
-                            self.reroute_records(records);
-                            return Ok(());
+                            Ok(_) => {
+                                debug!("HA failover completed; re-routing the batch's {record_count} record(s)");
+                                self.reroute_records(records);
+                                return Ok(());
+                            }
                         }
-                        Err(failover_err) => {
-                            // A failover that has tried every cluster is
-                            // reported with the failover's message, then what
-                            // failed on the workers
-                            warn!("HA failover failed: {failover_err}");
-                            break KineticaError::caused(
-                                format!(
-                                    "{}.  Original causes  encountered by workers: {}",
-                                    failover_err.message(),
-                                    original_causes(&current_worker_url, &e)
-                                ),
-                                failover_err,
-                            );
-                        }
+                    }
+                    Err(failover_err) => {
+                        // A failover that has tried every cluster is
+                        // reported with the failover's message, then what
+                        // failed on the workers
+                        warn!("HA failover failed: {failover_err}");
+                        KineticaError::caused(
+                            format!(
+                                "{}.  Original causes  encountered by workers: {}",
+                                failover_err.message(),
+                                original_causes(&current_worker_url, &e)
+                            ),
+                            failover_err,
+                        )
                     }
                 }
             }
         };
+        let attempt = retries.resends();
 
         // The batch failed - queue error and notify listener, with the error's
         // own message, without its kind
@@ -2578,27 +2668,34 @@ impl<T: Serialize + ShardKeyExtractor + Send + Sync + 'static> BulkInserter<T> {
         Err(failure)
     }
 
-    /// Sends a batch once to `url`.
-    async fn submit_batch(&self, url: &str, req: &BatchRequest, record_count: usize) -> Result<BatchOutcome, KineticaError> {
+    /// Sends a batch to `url`, re-sent to it as `retries` allows.
+    async fn submit_batch(
+        &self,
+        url: &str,
+        req: &BatchRequest,
+        record_count: usize,
+        retries: &RequestRetries,
+    ) -> Result<BatchOutcome, KineticaError> {
         match req {
             BatchRequest::Avro { body, snappy, .. } => {
                 let resp = self
                     .kinetica
-                    .submit_encoded_request_raw::<InsertRecordsResponse>(url, body.clone(), *snappy, &self.resp_schema)
+                    .submit_encoded_request_raw::<InsertRecordsResponse>(url, body.clone(), *snappy, &self.resp_schema, retries)
                     .await?;
                 Ok(BatchOutcome {
                     inserted: resp.count_inserted as i64,
                     updated: resp.count_updated as i64,
                     info: Some(resp.info),
+                    json_warnings: Vec::new(),
                 })
             }
             BatchRequest::Json(payload) => {
                 let response = self
                     .kinetica
-                    .insert_records_from_json_at(url, payload, &self.table_name, self.options.as_ref())
+                    .insert_records_from_json_at(url, payload, &self.table_name, self.options.as_ref(), retries)
                     .await?;
                 let (inserted, updated) = json_insert_counts(&response, record_count)?;
-                Ok(BatchOutcome { inserted, updated, info: None })
+                Ok(BatchOutcome { inserted, updated, info: None, json_warnings: json_reply_warnings(&response) })
             }
         }
     }
@@ -2612,14 +2709,24 @@ impl<T: Serialize + ShardKeyExtractor + Send + Sync + 'static> BulkInserter<T> {
     /// Each error carries the record its index names, and counts one. A
     /// per-record error switches on "stop on error" mode when
     /// `return_individual_errors` is active.
+    ///
+    /// Where the batch was re-sent after `uncertain_failure`, a failure that
+    /// leaves an earlier copy's outcome unknown, the primary-key collisions
+    /// it met are warnings that those records may already have been stored,
+    /// not errors; see [`possibly_stored`].
     fn gather_record_errors(
         &self,
         worker_url: &str,
         info: &HashMap<String, String>,
         encode_failures: &[EncodeFailure],
         records: &[Arc<T>],
+        uncertain_failure: Option<&str>,
     ) {
-        let (errors, warnings) = record_messages_from_info(info, encode_failures);
+        let (mut errors, mut warnings) = record_messages_from_info(info, encode_failures);
+        for warning in possibly_stored(uncertain_failure, &mut errors, &mut warnings) {
+            warn!("{warning}");
+            self.queue_warning(warning);
+        }
         for (index, message) in errors {
             if self.return_individual_errors {
                 self.simulate_error_mode.store(true, Ordering::Release);
@@ -2778,12 +2885,14 @@ impl<T: Serialize + ShardKeyExtractor + Send + Sync + 'static> BulkInserter<T> {
         self.routing_state.load().use_head_node
     }
 
-    /// Returns the current maximum retries for failed insertions.
+    /// Returns how many times a batch is sent again to its worker before it
+    /// fails over; see [`BulkInserterOptions::max_retries`].
     pub fn max_retries(&self) -> usize {
         self.max_retries.load(Ordering::Relaxed)
     }
 
-    /// Sets the maximum retries for failed insertions.
+    /// Sets how many times a batch is sent again to its worker before it
+    /// fails over; see [`BulkInserterOptions::max_retries`].
     pub fn set_max_retries(&self, max_retries: usize) {
         self.max_retries.store(max_retries, Ordering::Relaxed);
     }
@@ -2937,6 +3046,16 @@ impl<T: Serialize + ShardKeyExtractor + Send + Sync + 'static> BulkInserter<T> {
     }
 
     /// Drains and returns all queued warnings.
+    ///
+    /// Among them, for a table with a primary key: a batch re-sent after its
+    /// first copy's outcome was lost (sent in full and then no response, or a
+    /// rank failing while handling it) may meet records that copy stored.
+    /// The server skips those as primary-key collisions, and they are reported
+    /// here as records that may already have been stored, not as errors:
+    /// `Record <index> may already have been stored by an earlier copy of the
+    /// batch, which was re-sent after: <failure>`, by the record's index in
+    /// the batch, or `Records the server reported as already existing ...`
+    /// for the batch as a whole.
     pub fn drain_warnings(&self) -> Vec<String> {
         let mut queue = self.warning_queue.lock();
         std::mem::take(&mut *queue)
@@ -3556,7 +3675,7 @@ impl<T: Serialize + ShardKeyExtractor + Send + Sync + 'static> BulkInserter<T> {
         worker_url: &str,
         current_count_cluster_switches: usize,
     ) -> Result<(), KineticaError> {
-        let had_connection_failure = is_connection_error(error);
+        let had_connection_failure = is_failover_trigger(error);
         let mut did_failover_succeed = false;
 
         if had_connection_failure {
@@ -3763,31 +3882,66 @@ mod routing_state_tests {
     }
 }
 
-/// Which insert failures are retried and can trigger a failover: a server
-/// exit or a connection failure.
+/// Which insert failures fail over, and how a re-sent batch's primary-key
+/// collisions are reported.
 #[cfg(test)]
 mod retry_policy_tests {
     use super::*;
 
     #[test]
-    fn exits_and_connection_failures_are_retried() {
-        assert!(is_connection_error(&KineticaError::Exit("Kinetica is exiting".into())));
-        assert!(is_connection_error(&KineticaError::Connection("refused".into())));
+    fn exits_connection_failures_and_http_errors_fail_over() {
+        assert!(is_failover_trigger(&KineticaError::Exit("Kinetica is exiting".into())));
+        assert!(is_failover_trigger(&KineticaError::Connection("refused".into())));
+        assert!(is_failover_trigger(&KineticaError::Http("sent in full; no response".into())));
     }
 
     #[test]
-    fn other_failures_are_not() {
+    fn other_failures_do_not() {
         for e in [
-            // A submit failure: the server may already have applied the insert.
-            KineticaError::Http("Failed to read response".into()),
-            // A server-side data error: retrying cannot help.
+            // A server-side data error: another cluster would meet it again.
             KineticaError::Api("Invalid value for column".into()),
             KineticaError::Unauthorized("401".into()),
             KineticaError::Avro("encode".into()),
             KineticaError::Config("SSL".into()),
         ] {
-            assert!(!is_connection_error(&e), "{e:?} must not be retried");
+            assert!(!is_failover_trigger(&e), "{e:?} must not fail over");
         }
+    }
+
+    // A batch re-sent after its first copy's outcome was lost reports the
+    // collisions it meets as records that may already have been stored.
+    #[test]
+    fn a_re_sent_batchs_collisions_are_possibly_stored() {
+        let collision = "Primary Key already exists for record".to_string();
+        let mut errors = vec![(Some(0), collision.clone()), (Some(2), "Invalid value".into()), (None, collision.clone())];
+        let mut warnings = vec!["truncated".to_string(), "Primary Key already exists".to_string()];
+        let stored = possibly_stored(Some("lost"), &mut errors, &mut warnings);
+        assert_eq!(
+            stored,
+            [
+                "Record 0 may already have been stored by an earlier copy of the batch, which was re-sent after: lost",
+                "Records the server reported as already existing may already have been stored by an earlier copy of \
+                 the batch, which was re-sent after: lost",
+            ]
+        );
+        assert_eq!(errors, [(Some(2), "Invalid value".to_string()), (None, collision)], "the record's own error stays");
+        assert_eq!(warnings, ["truncated"]);
+    }
+
+    // A batch that was not re-sent so keeps its collisions as they came.
+    #[test]
+    fn a_batch_not_re_sent_keeps_its_collisions() {
+        let mut errors = vec![(Some(0), "Primary Key already exists".to_string())];
+        let mut warnings = vec!["Primary Key already exists".to_string()];
+        assert!(possibly_stored(None, &mut errors, &mut warnings).is_empty());
+        assert_eq!((errors.len(), warnings.len()), (1, 1));
+    }
+
+    #[test]
+    fn a_json_replys_warnings_are_read_from_its_info() {
+        let reply = serde_json::json!({"status": "OK", "data": {"info": {"warning_2": "b", "x": "c", "WARNING_1": "a"}}});
+        assert_eq!(json_reply_warnings(reply.as_object().unwrap()), ["a", "b"]);
+        assert!(json_reply_warnings(serde_json::json!({"data": {}}).as_object().unwrap()).is_empty());
     }
 }
 
@@ -4171,6 +4325,12 @@ mod json_tests {
     /// Answers the head node's calls for a table `t` of one int, and the
     /// shard mapping `ranks`.
     fn head_handler(server: &fake_server::FakeServer, ranks: Vec<i32>) {
+        table_handler(server, ranks, HashMap::new());
+    }
+
+    /// Answers as [`head_handler`] does, for a table whose columns have
+    /// `properties`.
+    fn table_handler(server: &fake_server::FakeServer, ranks: Vec<i32>, properties: HashMap<String, Vec<String>>) {
         let schema = r#"{"type":"record","name":"t","fields":[{"name":"id","type":"int"}]}"#.to_string();
         *server.behavior.handler.lock() = Some(Arc::new(move |path: &str, _: &[u8]| {
             let reply = match path {
@@ -4187,7 +4347,7 @@ mod json_tests {
                         type_ids: vec!["tid".into()],
                         type_schemas: vec![schema.clone()],
                         type_labels: vec!["t".into()],
-                        properties: vec![HashMap::new()],
+                        properties: vec![properties.clone()],
                         ..Default::default()
                     },
                 ),
@@ -4199,6 +4359,131 @@ mod json_tests {
             };
             Some(Ok(reply))
         }));
+    }
+
+    /// Answers each batch at `/insert/records/json` with the next of
+    /// `replies`, a status line and a JSON body, and then as a success.
+    /// Counts the batches.
+    fn scripted_json_handler(server: &fake_server::FakeServer, replies: Vec<(&'static str, String)>) -> Arc<std::sync::atomic::AtomicUsize> {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let sends = Arc::new(AtomicUsize::new(0));
+        let sent = sends.clone();
+        *server.behavior.json_handler.lock() = Some(Arc::new(move |path: &str, _: &[u8]| {
+            path.strip_prefix("/insert/records/json?")?;
+            let n = sent.fetch_add(1, SeqCst);
+            Some(match replies.get(n) {
+                Some((status, json)) => (status.to_string(), json.clone()),
+                None => (
+                    "200 OK".to_string(),
+                    r#"{"status":"OK","message":"","data":{"count_inserted":1,"count_updated":0}}"#.to_string(),
+                ),
+            })
+        }));
+        sends
+    }
+
+    /// A JSON inserter into `t` on `head`, its connection allowed
+    /// `connection_retries` re-sends and the inserter `inserter_retries`.
+    async fn json_inserter(
+        head: &fake_server::FakeServer,
+        connection_retries: usize,
+        inserter_retries: usize,
+    ) -> Arc<BulkInserter<String>> {
+        let mut options = KineticaOptions::default();
+        options.set_server_connection_timeout(500).set_max_retries(connection_retries);
+        let k = Arc::new(Kinetica::new(vec![head.url.to_string()], options).await.expect("client"));
+        let mut inserter_options = BulkInserterOptions::new();
+        inserter_options.set_max_retries(inserter_retries);
+        BulkInserter::with_json_options(k, "t".into(), 10, 1, Some(inserter_options), JsonOptions::default())
+            .await
+            .expect("inserter")
+    }
+
+    // A batch has one budget of re-sends, the inserter's own: not the
+    // connection's as well, nor one budget inside the other.
+    #[tokio::test]
+    async fn a_batch_has_one_budget_of_re_sends() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let head = fake_server::start("127.0.0.239").await;
+        *head.behavior.properties.lock() = cluster_properties(&address(&head), &[]);
+        head_handler(&head, Vec::new());
+        let busy = r#"{"status":"ERROR","message":"busy"}"#.to_string();
+        let sends = scripted_json_handler(&head, vec![("503 Service Unavailable", busy); 50]);
+        let inserter = json_inserter(&head, 5, 2).await;
+
+        inserter.insert_batch(records(&[r#"{"id":1}"#])).unwrap();
+        let _ = inserter.flush().await;
+        assert_eq!(sends.load(SeqCst), 3, "sent, then re-sent twice");
+        let errors = inserter.drain_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains("Server exit: busy"), "{}", errors[0].message);
+        inserter.close().await.unwrap();
+    }
+
+    // A reply that reports the server's state fails over without a re-send:
+    // a second copy would meet the same state.
+    #[tokio::test]
+    async fn a_batch_meeting_a_server_state_is_not_re_sent() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let head = fake_server::start("127.0.0.243").await;
+        *head.behavior.properties.lock() = cluster_properties(&address(&head), &[]);
+        head_handler(&head, Vec::new());
+        let draining = r#"{"status":"ERROR","message":"Unavailable: Draining HA queue"}"#.to_string();
+        // A 503, which its status alone would have re-sent
+        let sends = scripted_json_handler(&head, vec![("503 Service Unavailable", draining)]);
+        let inserter = json_inserter(&head, 3, 3).await;
+
+        inserter.insert_batch(records(&[r#"{"id":1}"#])).unwrap();
+        let _ = inserter.flush().await;
+        assert_eq!(sends.load(SeqCst), 1, "not re-sent");
+        let errors = inserter.drain_errors();
+        assert_eq!(errors.len(), 1, "a single cluster gives up: {errors:?}");
+        assert!(errors[0].message.contains("Draining HA queue"), "{}", errors[0].message);
+        inserter.close().await.unwrap();
+    }
+
+    // A batch whose first copy may have been stored in part -- a rank
+    // failed while handling it -- is re-sent into a table with a primary key,
+    // where the server skips a key already stored, and the collisions the
+    // second copy meets are reported as records that may already have been
+    // stored. Into any other table it is not re-sent.
+    #[tokio::test]
+    async fn a_primary_key_batch_is_re_sent_and_its_collisions_are_possibly_stored() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let failed = || ("400 Bad Request", r#"{"status":"ERROR","message":"Rank 1 non-responsive"}"#.to_string());
+        let collided = r#"{"status":"OK","message":"","data":{"count_inserted":1,"count_updated":0,"info":{"warning_0":"Primary Key already exists"}}}"#;
+
+        let head = fake_server::start("127.0.0.244").await;
+        *head.behavior.properties.lock() = cluster_properties(&address(&head), &[]);
+        table_handler(&head, Vec::new(), HashMap::from([("id".to_string(), vec!["primary_key".to_string()])]));
+        let sends = scripted_json_handler(&head, vec![failed(), ("200 OK", collided.to_string())]);
+        let inserter = json_inserter(&head, 0, 3).await;
+        inserter.insert_batch(records(&[r#"{"id":1}"#, r#"{"id":2}"#])).unwrap();
+        inserter.flush().await.unwrap();
+        assert_eq!(sends.load(SeqCst), 2, "re-sent once");
+        assert!(inserter.drain_errors().is_empty());
+        let warnings = inserter.drain_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with(
+                "Records the server reported as already existing may already have been stored by an earlier copy \
+                 of the batch, which was re-sent after: 400 Bad Request: Rank 1 non-responsive"
+            ),
+            "{}",
+            warnings[0]
+        );
+        inserter.close().await.unwrap();
+
+        let head = fake_server::start("127.0.0.245").await;
+        *head.behavior.properties.lock() = cluster_properties(&address(&head), &[]);
+        head_handler(&head, Vec::new());
+        let sends = scripted_json_handler(&head, vec![failed()]);
+        let inserter = json_inserter(&head, 0, 3).await;
+        inserter.insert_batch(records(&[r#"{"id":1}"#])).unwrap();
+        let _ = inserter.flush().await;
+        assert_eq!(sends.load(SeqCst), 1, "not re-sent without a primary key");
+        assert_eq!(inserter.drain_errors().len(), 1);
+        inserter.close().await.unwrap();
     }
 
     /// The batches a server took at `/insert/records/json`, with their

@@ -107,7 +107,13 @@ impl KifsFileHandler {
     ///
     /// # Errors
     ///
-    /// Returns an aggregated error containing all failure messages if any files fail to upload.
+    /// Fails before anything is uploaded where a file named does not exist,
+    /// a pattern or directory matches no local file, a directory cannot be
+    /// read, or two different files would be uploaded to the same KiFS path;
+    /// every name that matches nothing is named in the one error. The same
+    /// file given twice is uploaded once.
+    ///
+    /// Otherwise returns an aggregated error containing all failure messages if any files fail to upload.
     /// The operation continues processing remaining files even when individual uploads fail.
     ///
     /// # Example
@@ -149,7 +155,13 @@ impl KifsFileHandler {
     ///
     /// # Errors
     ///
-    /// Returns an aggregated error containing all failure messages if any files fail to upload.
+    /// Fails before anything is uploaded where a file named does not exist,
+    /// a pattern or directory matches no local file, a directory cannot be
+    /// read, or two different files would be uploaded to the same KiFS path;
+    /// every name that matches nothing is named in the one error. The same
+    /// file given twice is uploaded once.
+    ///
+    /// Otherwise returns an aggregated error containing all failure messages if any files fail to upload.
     /// The operation continues processing remaining files even when individual uploads fail.
     pub async fn upload_multiple(
         &self,
@@ -165,9 +177,8 @@ impl KifsFileHandler {
 
         // Validate that explicit files exist. A glob pattern passes this
         // check (`local_file_exists` returns true for it) and is resolved
-        // later; a pattern that then matches nothing is only a warning, but a
-        // plain name that does not exist fails the whole upload here, before
-        // anything is sent.
+        // later, where one that matches nothing fails the whole upload too,
+        // before anything is sent.
         if file_names.is_empty() {
             return Err(KineticaError::Config(
                 "List of local files to upload cannot be empty".to_string(),
@@ -372,9 +383,11 @@ impl KifsFileHandler {
     ///
     /// # Errors
     ///
-    /// Fails if no file is named, a name is empty, or a file named (not a
-    /// pattern) does not exist; and with the upload's or the insert's error
-    /// if either fails.
+    /// Fails if no file is named, a name is empty, a file named does not
+    /// exist, a pattern or directory matches no local file, or two different
+    /// files would be staged at the same KiFS path, before anything is
+    /// uploaded; and with the upload's or the insert's error if either
+    /// fails.
     pub async fn ingest(
         &self,
         file_names: Vec<String>,

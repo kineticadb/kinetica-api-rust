@@ -161,15 +161,34 @@ impl ParsedFileName {
     }
 }
 
-/// Checks if a string contains glob pattern characters: `*`, `?`, `{`, `[`
-/// or `\`.
+/// Checks if a string contains glob pattern characters: `*`, `?`, `{`, `[`,
+/// and `\` where it is not the platform's path separator.
 ///
-/// So on Unix a file whose name contains a literal `[`, `{`, `?` or `\` is
-/// searched for as a pattern rather than opened by name (and, with a
-/// character class, may match other files or none), and on Windows, where
-/// `\` is the path separator, every path counts as a pattern.
+/// In the glob syntax a backslash escapes the character after it, but on
+/// Windows it separates path elements, and reading it as an escape there
+/// would make every absolute path a pattern.
+///
+/// A name holding one of these may still name a file: see
+/// [`literal_exists`], which the upload consults first.
 pub fn is_glob_pattern(s: &str) -> bool {
-    s.contains('*') || s.contains('?') || s.contains('{') || s.contains('[') || s.contains('\\')
+    s.contains(['*', '?', '{', '[']) || (std::path::MAIN_SEPARATOR != '\\' && s.contains('\\'))
+}
+
+/// Whether a file or directory of exactly the name `path` exists. `[` and `{`
+/// are legal in file names, and a name that exists is what the caller meant,
+/// not the class of names it could also be read as.
+///
+/// Blocking; call it from a blocking context.
+pub(crate) fn literal_exists(path: &str) -> bool {
+    !path.trim().is_empty() && Path::new(path).exists()
+}
+
+/// Whether two local paths name the same file, however each is written.
+pub(crate) fn is_same_local_file(one: &str, other: &str) -> bool {
+    match (normalize_absolute(Path::new(one)), normalize_absolute(Path::new(other))) {
+        (Ok(one), Ok(other)) => one == other,
+        _ => one == other,
+    }
 }
 
 /// Checks if a local directory exists.
@@ -533,8 +552,9 @@ fn walk_files(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<PathBuf>
 /// The two cases are handled differently by the upload.
 #[derive(Debug)]
 pub enum SearchError {
-    /// The search's start directory could not be listed. The failure is
-    /// logged, and the upload goes ahead without that name's files.
+    /// The search's start directory could not be listed. The upload goes on
+    /// resolving the other names, then fails, naming each such failure,
+    /// before anything is uploaded.
     StartDirUnreadable(std::io::Error),
     /// Anything else: an invalid pattern or a subdirectory that could not be
     /// listed. The upload fails.
@@ -594,8 +614,8 @@ pub fn search_local_directories(
         )))
     })?;
     if !start_path.is_dir() {
-        // A missing directory is logged and yields no files rather than
-        // failing the upload.
+        // A missing directory yields no files, which the upload refuses as a
+        // name that matches nothing.
         error!("Directory does not exist: {base_dir}");
         return Ok((local_paths, remote_paths));
     }
@@ -960,10 +980,18 @@ mod local_file_tests {
 
     #[test]
     fn glob_characters_are_recognized() {
-        for s in ["*.csv", "a?.csv", "{a,b}.csv", "[ab].csv", "a\\b.csv"] {
+        for s in ["*.csv", "a?.csv", "{a,b}.csv", "[ab].csv"] {
             assert!(is_glob_pattern(s), "{s} should be a pattern");
         }
         assert!(!is_glob_pattern("/data/plain_file.csv"));
+        // A backslash escapes, except where it separates path elements
+        assert_eq!(is_glob_pattern("a\\b.csv"), !cfg!(windows));
+    }
+
+    #[test]
+    fn the_same_file_is_recognized_however_it_is_written() {
+        assert!(is_same_local_file("/a/b/../c.csv", "/a/./c.csv"));
+        assert!(!is_same_local_file("/a/c.csv", "/b/c.csv"));
     }
 
     // `local_file_exists` skips the check for `* ? { [` but not for a

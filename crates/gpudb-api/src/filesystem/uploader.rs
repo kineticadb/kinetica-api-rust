@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::task::JoinSet;
@@ -10,8 +10,9 @@ use uuid::Uuid;
 
 use crate::{Kinetica, KineticaError, UploadFilesRequest};
 use super::file_operation::{
-    aggregate_failures, categorize_files_by_size, is_glob_pattern, io_error_message, local_file_exists,
-    parse_file_name, search_local_directories, FileBatch, FullFileBatcher, SearchError,
+    aggregate_failures, categorize_files_by_size, is_glob_pattern, is_same_local_file, io_error_message,
+    literal_exists, local_file_exists, parse_file_name, search_local_directories, FileBatch, FullFileBatcher,
+    SearchError,
 };
 use super::listeners::FileUploadListener;
 use super::options::{KifsFileHandlerOptions, UploadOptions};
@@ -77,9 +78,20 @@ impl<'a> FileUploader<'a> {
     /// per batch of whole files sent, listing them in `full_file_names`; and
     /// one per file that could not be read. A failure does not stop the
     /// rest; their messages are joined, a line each, into the error returned.
+    ///
+    /// Fails before anything is uploaded where a name or pattern matches no
+    /// local file, or two different files would be uploaded to the same
+    /// remote path; see [`resolve_files`].
     pub async fn upload(&self) -> Result<Vec<OperationResult>, KineticaError> {
-        let (local_files, remote_files) = self.resolve().await?;
-        self.upload_resolved(&local_files, &remote_files).await
+        let resolved = self.resolve().await?;
+        // Two files bound for one remote path would overwrite each other
+        if !resolved.files_with_duplicate_names.is_empty() {
+            return Err(KineticaError::Config(format!(
+                "Files with the same name cannot be uploaded together: [{}]; nothing was uploaded",
+                resolved.files_with_duplicate_names.join(", ")
+            )));
+        }
+        self.upload_resolved(&resolved.local_files, &resolved.remote_files).await
     }
 
     /// Uploads the files resolved, each to its remote path, as
@@ -101,16 +113,6 @@ impl<'a> FileUploader<'a> {
         let mut all_results = self.upload_multi_part_files(&multipart_files).await;
         all_results.extend(self.upload_full_files(batch_manager.batches()).await);
 
-        // A pattern that matched nothing (or a recursive search that found
-        // nothing) is only a warning, and the upload returns successfully
-        // having uploaded nothing. Names that are not patterns were already
-        // checked to exist by the handler. The risk is that a typo in a
-        // pattern passes silently; callers who need at least one file should
-        // check the returned results.
-        if batch_manager.number_of_batches() == 0 && multipart_files.is_empty() {
-            warn!("No files found to upload ...");
-        }
-
         // Report every failure together, rather than the first one only.
         if let Some(e) = aggregate_failures(&all_results) {
             return Err(e);
@@ -120,12 +122,12 @@ impl<'a> FileUploader<'a> {
     }
 
     /// Resolves the file names to upload into the local files found and the
-    /// remote path of each, in the order found.
+    /// remote path of each, in the order found; see [`resolve_files`].
     ///
     /// This walks directories, which is blocking I/O, so it runs on the
     /// runtime's blocking pool, where it does not stall the async worker
     /// threads.
-    pub(crate) async fn resolve(&self) -> Result<(Vec<String>, Vec<String>), KineticaError> {
+    pub(crate) async fn resolve(&self) -> Result<ResolvedFiles, KineticaError> {
         let file_names = self.file_names.clone();
         let remote_dir_name = self.remote_dir_name.clone();
         let recursive = self.upload_options.recursive;
@@ -480,71 +482,125 @@ fn wave_ceiling(
     }
 }
 
-/// Resolves file names/patterns to actual file paths.
+/// The local files an upload resolves to, each with its remote path.
+#[derive(Debug, Default)]
+pub(crate) struct ResolvedFiles {
+    /// The local files found, in the order found, each once
+    pub(crate) local_files: Vec<String>,
+    /// The remote path of each
+    pub(crate) remote_files: Vec<String>,
+    /// The local files bound for the same remote path as another of them,
+    /// each with the first file found for that path: uploaded together, one
+    /// would overwrite the other. Empty where every remote path is unique.
+    pub(crate) files_with_duplicate_names: Vec<String>,
+}
+
+/// Resolves the names given into the local files they name and the remote
+/// path of each, under `remote_dir_name`.
 ///
-/// Blocking; see [`FileUploader::resolve_and_categorize`].
-fn resolve_files(
+/// - A name holding a glob character is a pattern, searched for below the
+///   directory before its first pattern component -- unless a file or
+///   directory of exactly that name exists, which is taken instead: given
+///   `q[1].csv`, the file of that name, never `q1.csv`.
+/// - A directory is every file in it, and in its subdirectories too if
+///   `recursive`.
+/// - A file is that file alone, even when `recursive` is set; same-named
+///   files below its directory are not uploaded.
+///
+/// A pattern or directory that matches no file is an error, as a file that
+/// does not exist is, and so is one whose directory cannot be read; every
+/// such name is named in one error, before anything is uploaded. The same
+/// local file given twice, however each is written, is taken once; two
+/// different files bound for one remote path are listed in
+/// [`ResolvedFiles::files_with_duplicate_names`], for the caller to refuse.
+///
+/// Blocking; call it from a blocking context.
+pub(crate) fn resolve_files(
     file_names: &[String],
     remote_dir_name: &str,
     recursive: bool,
-) -> Result<(Vec<String>, Vec<String>), KineticaError> {
-    let mut local_files = Vec::new();
-    let mut remote_files = Vec::new();
+) -> Result<ResolvedFiles, KineticaError> {
+    let mut resolved = ResolvedFiles::default();
+    // The first local file found for each remote path
+    let mut local_file_of_remote: HashMap<String, String> = HashMap::new();
+    let mut unmatched: Vec<&str> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
 
     for file_name in file_names {
         let parsed = parse_file_name(file_name);
+        let explicit_path = parsed.file_path();
 
         // `recursive` decides how deep a pattern searches, and how deep a
-        // directory given by name is uploaded. A file given by name is that
-        // file alone, even when `recursive` is set (the default); same-named
-        // files below its directory are not uploaded.
-        let directory = std::path::Path::new(&parsed.file_path()).is_dir();
-        let search = if is_glob_pattern(&parsed.pattern) {
+        // directory given by name is uploaded.
+        let is_pattern = is_glob_pattern(&parsed.pattern) && !literal_exists(&explicit_path);
+        let search = if is_pattern {
             Some((parsed.base_dir.clone(), parsed.pattern.clone()))
-        } else if directory {
+        } else if std::path::Path::new(&explicit_path).is_dir() {
             // Its files, as `<directory>/*` gives them
-            Some((parsed.file_path(), "*".to_string()))
+            Some((explicit_path.clone(), "*".to_string()))
         } else {
             None
         };
-        if let Some((base_dir, pattern)) = search {
-            // Use glob pattern matching
-            match search_local_directories(&base_dir, &pattern, remote_dir_name, recursive) {
-                Ok((mut locals, mut remotes)) => {
-                    local_files.append(&mut locals);
-                    remote_files.append(&mut remotes);
-                }
+        let (locals, remotes) = match search {
+            Some((base_dir, pattern)) => match search_local_directories(&base_dir, &pattern, remote_dir_name, recursive) {
+                Ok(found) => found,
                 Err(SearchError::StartDirUnreadable(e)) => {
-                    // The walk's error is logged and the upload goes ahead
-                    // without that name's files. The names after this one are
-                    // still resolved.
-                    error!("Error resolving local files for upload: {e}");
+                    unreadable.push(format!("{file_name} ({e})"));
                     continue;
                 }
                 Err(SearchError::Failed(e)) => return Err(e),
-            }
-        } else {
-            // Simple file - check if it exists
-            let full_path = parsed.file_path();
+            },
+            // A file named; the name keeps any directory elements under the
+            // base that the parse left it (a directory named with a glob
+            // character), written with the KiFS separator
+            None if local_file_exists(&explicit_path) => (
+                vec![explicit_path],
+                vec![format!(
+                    "{remote_dir_name}{KIFS_PATH_SEPARATOR}{}",
+                    parsed.pattern.replace(std::path::MAIN_SEPARATOR, KIFS_PATH_SEPARATOR)
+                )],
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        if locals.is_empty() {
+            unmatched.push(file_name);
+            continue;
+        }
 
-            if local_file_exists(&full_path) {
-                local_files.push(full_path);
-                let remote_path = format!(
-                    "{}{}{}",
-                    remote_dir_name,
-                    KIFS_PATH_SEPARATOR,
-                    parsed.pattern
-                );
-                remote_files.push(remote_path);
-            } else {
-                // Unreachable through the handler, which rejects a missing
-                // plain file before the upload starts.
-                warn!("Local file not found, skipping: {full_path}");
+        for (local, remote) in locals.into_iter().zip(remotes) {
+            match local_file_of_remote.get(&remote) {
+                // The same local file given twice: taken once
+                Some(first) if is_same_local_file(first, &local) => continue,
+                // Another file bound for this remote path: both named
+                Some(first) => {
+                    for name in [first.clone(), local] {
+                        if !resolved.files_with_duplicate_names.contains(&name) {
+                            resolved.files_with_duplicate_names.push(name);
+                        }
+                    }
+                }
+                None => {
+                    local_file_of_remote.insert(remote.clone(), local.clone());
+                    resolved.local_files.push(local);
+                    resolved.remote_files.push(remote);
+                }
             }
         }
     }
 
-    Ok((local_files, remote_files))
+    // Refused here, before anything is uploaded
+    if !unmatched.is_empty() || !unreadable.is_empty() {
+        let mut reasons = Vec::new();
+        if !unmatched.is_empty() {
+            reasons.push(format!("No local file matches [{}]", unmatched.join(", ")));
+        }
+        if !unreadable.is_empty() {
+            reasons.push(format!("Local files could not be resolved: [{}]", unreadable.join(", ")));
+        }
+        return Err(KineticaError::Config(format!("{}; nothing was uploaded", reasons.join("; "))));
+    }
+
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -554,7 +610,7 @@ mod tests {
 
     fn remotes(dir: &TempDir, names: &[&str], recursive: bool) -> Vec<String> {
         let names: Vec<String> = names.iter().map(|n| format!("{}/{n}", dir.str())).collect();
-        resolve_files(&names, "kdir", recursive).expect("resolve").1
+        resolve_files(&names, "kdir", recursive).expect("resolve").remote_files
     }
 
     /// What a stand-in server saw of each `/upload/files` request: its file
@@ -767,7 +823,8 @@ mod tests {
         let dir = TempDir::new("resolve_recursive");
         dir.write("a.csv", b"1");
         dir.write("sub/a.csv", b"1");
-        let (locals, uploaded) = resolve_files(&[format!("{}/a.csv", dir.str())], "kdir", true).unwrap();
+        let resolved = resolve_files(&[format!("{}/a.csv", dir.str())], "kdir", true).unwrap();
+        let (locals, uploaded) = (resolved.local_files, resolved.remote_files);
         assert_eq!(uploaded, vec!["kdir/a.csv"]);
         assert_eq!(locals, vec![format!("{}{}a.csv", dir.str(), std::path::MAIN_SEPARATOR)]);
         assert_eq!(remotes(&dir, &["*.csv"], true), vec!["kdir/a.csv", "kdir/sub/a.csv"], "a pattern still searches");
@@ -784,11 +841,34 @@ mod tests {
         assert_eq!(remotes(&dir, &["data"], true), vec!["kdir/a.csv", "kdir/sub/b.csv"]);
     }
 
-    #[test]
-    fn a_pattern_that_matches_nothing_resolves_to_no_files() {
+    // A pattern that matches nothing, or two files bound for one remote
+    // path, fail the upload before anything is sent.
+    #[tokio::test]
+    async fn an_upload_that_cannot_be_resolved_sends_nothing() {
+        let (_server, k, seen) = server("127.0.0.248", |_, _| false).await;
         let dir = TempDir::new("resolve_nothing");
         dir.write("a.csv", b"1");
-        assert!(remotes(&dir, &["*.json"], false).is_empty());
+        dir.write("sub/a.csv", b"2");
+        let heard = Heard::default();
+
+        let names = vec![format!("{}/a.csv", dir.str()), format!("{}/*.json", dir.str())];
+        let message = uploader(&k, names, 1024, -1, &heard).upload().await.unwrap_err().to_string();
+        assert_eq!(
+            message,
+            format!("Configuration error: No local file matches [{}/*.json]; nothing was uploaded", dir.str())
+        );
+
+        let names = vec![format!("{}/a.csv", dir.str()), format!("{}/sub/a.csv", dir.str())];
+        let message = uploader(&k, names, 1024, -1, &heard).upload().await.unwrap_err().to_string();
+        assert_eq!(
+            message,
+            format!(
+                "Configuration error: Files with the same name cannot be uploaded together: [{0}/a.csv, {0}/sub/a.csv]; \
+                 nothing was uploaded",
+                dir.str()
+            )
+        );
+        assert!(seen.lock().is_empty(), "nothing was sent");
     }
 
     #[test]
@@ -810,36 +890,92 @@ mod tests {
         assert!(resolve_files(&names, "kdir", false).is_err());
     }
 
-    // An unreadable start directory leaves its own files out, logged; the
-    // names after it are still resolved.
+    // A directory that cannot be read fails the upload, named with its
+    // failure, after the names after it are still resolved.
     #[cfg(unix)]
     #[test]
-    fn an_unreadable_directory_leaves_out_only_its_own_files() {
+    fn an_unreadable_directory_fails_the_upload() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TempDir::new("resolve_unreadable");
         dir.write("a.csv", b"1");
         dir.write("locked/b.csv", b"1");
-        dir.write("c.csv", b"1");
         let locked = dir.path().join("locked");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         // Running as root, permissions are not enforced; nothing to test.
         let enforced = std::fs::read_dir(&locked).is_err();
 
-        let names: Vec<String> = [
-            format!("{}/a.csv", dir.str()),
-            format!("{}/locked/*.csv", dir.str()),
-            format!("{}/c.csv", dir.str()),
-        ]
-        .to_vec();
+        let pattern = format!("{}/locked/*.csv", dir.str());
+        let names = vec![format!("{}/a.csv", dir.str()), pattern.clone(), format!("{}/missing/*.csv", dir.str())];
         let result = resolve_files(&names, "kdir", false);
 
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         if enforced {
-            assert_eq!(result.expect("resolve").1, vec!["kdir/a.csv", "kdir/c.csv"]);
+            let message = result.unwrap_err().to_string();
+            assert!(message.contains(&format!("Local files could not be resolved: [{pattern} (")), "{message}");
+            assert!(message.contains("/missing/*.csv]"), "the name after it was resolved too: {message}");
         }
+    }
+
+    // Every name that matches no local file -- a pattern, an empty
+    // directory, a file that is not there -- is named in one error, and
+    // nothing is resolved.
+    #[test]
+    fn names_that_match_nothing_are_refused_together() {
+        let dir = TempDir::new("resolve_unmatched");
+        dir.write("a.csv", b"1");
+        std::fs::create_dir(dir.path().join("empty")).unwrap();
+        let names: Vec<String> = ["a.csv", "*.json", "empty", "nope.csv", "gone/*.csv"]
+            .iter()
+            .map(|n| format!("{}/{n}", dir.str()))
+            .collect();
+        let message = resolve_files(&names, "kdir", true).unwrap_err().to_string();
+        assert_eq!(
+            message,
+            format!(
+                "Configuration error: No local file matches [{0}/*.json, {0}/empty, {0}/nope.csv, {0}/gone/*.csv]; \
+                 nothing was uploaded",
+                dir.str()
+            )
+        );
+    }
+
+    // A name holding a glob character names the file of exactly that name
+    // where one exists, not the class of names it could be read as; a
+    // directory too.
+    #[test]
+    fn a_file_whose_name_looks_like_a_pattern_is_taken_by_name() {
+        let dir = TempDir::new("resolve_literal");
+        dir.write("q[1].csv", b"1");
+        dir.write("q1.csv", b"1");
+        dir.write("d{x}/a.csv", b"1");
+        assert_eq!(remotes(&dir, &["q[1].csv"], false), vec!["kdir/q[1].csv"]);
+        assert_eq!(remotes(&dir, &["d{x}"], false), vec!["kdir/a.csv"]);
+        assert_eq!(remotes(&dir, &["d{x}/a.csv"], false), vec!["kdir/d{x}/a.csv"]);
+        // Where none exists, it is a pattern
+        assert_eq!(remotes(&dir, &["q[0-9].csv"], false), vec!["kdir/q1.csv"]);
+    }
+
+    // Two different files bound for one remote path are both named, for the
+    // caller to refuse; the same file given twice, however written, is
+    // taken once.
+    #[test]
+    fn files_bound_for_one_remote_path_are_caught() {
+        let dir = TempDir::new("resolve_duplicates");
+        dir.write("a/x.csv", b"1");
+        dir.write("b/x.csv", b"2");
+        dir.write("c.csv", b"3");
+        let name = |n: &str| format!("{}/{n}", dir.str());
+
+        let resolved = resolve_files(&[name("a/x.csv"), name("b/x.csv"), name("c.csv")], "kdir", false).unwrap();
+        assert_eq!(resolved.files_with_duplicate_names, vec![name("a/x.csv"), name("b/x.csv")]);
+        assert_eq!(resolved.remote_files, vec!["kdir/x.csv", "kdir/c.csv"]);
+
+        let resolved = resolve_files(&[name("c.csv"), name("a/../c.csv"), name("*.csv")], "kdir", false).unwrap();
+        assert!(resolved.files_with_duplicate_names.is_empty(), "{:?}", resolved.files_with_duplicate_names);
+        assert_eq!(resolved.remote_files, vec!["kdir/c.csv"]);
     }
 
     #[test]
@@ -849,7 +985,8 @@ mod tests {
             dir.write(name, b"12");
         }
         let names = vec![format!("{}/*.csv", dir.str())];
-        let (locals, remotes) = resolve_files(&names, "kdir", false).unwrap();
+        let resolved = resolve_files(&names, "kdir", false).unwrap();
+        let (locals, remotes) = (resolved.local_files, resolved.remote_files);
         let options = KifsFileHandlerOptions::new().with_file_size_to_split(4).unwrap();
         let (manager, multipart) = categorize_files_by_size(&locals, &remotes, &options);
 

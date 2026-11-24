@@ -159,10 +159,12 @@ pub(crate) fn failover_exhausted(error: &KineticaError, ha_message: &str) -> Kin
 const HEADER_HA_SYNC_MODE: &str = "X-Kinetica-Group";
 const HEADER_AUTHORIZATION: &str = "Authorization";
 const HEADER_CONTENT_TYPE: &str = "Content-type";
-const HEADER_USER_AGENT: &str = "User-Agent";
+/// The header by which the client program and this API identify themselves
+/// to the server; see [`build_client_header`].
+const HEADER_CLIENT: &str = "X-Kinetica-Client";
 const HEADER_SESSION: &str = "X-Kinetica-Session";
 const PROTECTED_HEADERS: [&str; 5] =
-    [HEADER_HA_SYNC_MODE, HEADER_AUTHORIZATION, HEADER_CONTENT_TYPE, HEADER_USER_AGENT, HEADER_SESSION];
+    [HEADER_HA_SYNC_MODE, HEADER_AUTHORIZATION, HEADER_CONTENT_TYPE, HEADER_CLIENT, HEADER_SESSION];
 
 /// The key in a response's `info` map that the server sets to `"true"` once
 /// this connection's session owns objects (SQL `#name` temp tables) that
@@ -173,13 +175,13 @@ const RESPONSE_INFO_SESSION_ID_USED: &str = "session_id_used";
 /// closed waits.
 const SESSION_DROP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The program name reported in the `User-Agent` header sent with every
-/// request.
+/// The program name by which this API identifies itself in the
+/// `X-Kinetica-Client` header sent with every request.
 pub const USER_AGENT_PROGRAM_NAME: &str = "kinetica-api-rust";
 
-/// Replaces every character an HTTP `User-Agent` token cannot hold (RFC 7230
+/// Replaces every character an HTTP product token cannot hold (RFC 7230
 /// `tchar`) with an underscore.
-fn sanitize_user_agent_token(value: &str) -> String {
+fn sanitize_client_token(value: &str) -> String {
     if value.is_empty() {
         return "unknown".to_string();
     }
@@ -189,17 +191,18 @@ fn sanitize_user_agent_token(value: &str) -> String {
         .collect()
 }
 
-/// The `User-Agent` sent with every request, naming this client, the Rust
-/// compiler and the platform:
+/// The `X-Kinetica-Client` header sent with every request, naming the client
+/// program, this API, the Rust compiler and the platform, in the form of a
+/// `User-Agent`:
 ///
 /// ```text
 /// MyApp/1.0 kinetica-api-rust/7.2.3 (Rust/1.88.0; Linux/6.8.0-146-generic; amd64)
 /// ```
 ///
 /// The client program's name and version, if given, come first.
-fn build_user_agent(client_name: Option<&str>, client_version: Option<&str>) -> String {
+fn build_client_header(client_name: Option<&str>, client_version: Option<&str>) -> String {
     // The API version, without the build number
-    let api_version = sanitize_user_agent_token(env!("GPUDB_API_VERSION"));
+    let api_version = sanitize_client_token(env!("GPUDB_API_VERSION"));
     let os_name = match std::env::consts::OS {
         "linux" => "Linux",
         "macos" => "Mac OS X",
@@ -218,20 +221,20 @@ fn build_user_agent(client_name: Option<&str>, client_version: Option<&str>) -> 
         other => other,
     };
 
-    let mut user_agent = String::new();
+    let mut client = String::new();
     if let Some(name) = client_name.filter(|n| !n.is_empty()) {
-        user_agent.push_str(&sanitize_user_agent_token(name));
+        client.push_str(&sanitize_client_token(name));
         if let Some(version) = client_version.filter(|v| !v.is_empty()) {
-            user_agent.push('/');
-            user_agent.push_str(&sanitize_user_agent_token(version));
+            client.push('/');
+            client.push_str(&sanitize_client_token(version));
         }
-        user_agent.push(' ');
+        client.push(' ');
     }
-    user_agent.push_str(&format!(
+    client.push_str(&format!(
         "{USER_AGENT_PROGRAM_NAME}/{api_version} (Rust/{}; {os_name}/{os_version}; {os_arch})",
         env!("GPUDB_RUSTC_VERSION")
     ));
-    user_agent
+    client
 }
 
 /// The credentials to use: those of a `Basic` `Authorization` header among
@@ -320,14 +323,16 @@ pub struct KineticaOptions {
     /// Additional HTTP headers sent with each request.
     ///
     /// The headers the client sets itself (`Authorization`, `Content-type`,
-    /// `User-Agent` and `X-Kinetica-Group`) are not sent from here. `Basic`
+    /// `X-Kinetica-Client`, `X-Kinetica-Group` and `X-Kinetica-Session`) are
+    /// not sent from here; a `User-Agent` is, as any other header. `Basic`
     /// credentials in an `Authorization` header are used in place of the
     /// username and password, and an `X-Kinetica-Group` header names the HA
     /// synchronicity mode, by its value on the wire or its
     /// [`HaSynchronicityMode`] constant name (`REPL_SYNC` or `SYNCHRONOUS`).
     pub http_headers: HashMap<String, String>,
 
-    /// The client program's name, reported first in the `User-Agent` header.
+    /// The client program's name, reported first in the `X-Kinetica-Client`
+    /// header.
     pub client_name: Option<String>,
 
     /// The client program's version, reported with its name.
@@ -393,9 +398,15 @@ pub struct KineticaOptions {
     /// host is throttled to this many concurrent requests.
     pub max_connections_per_host: usize,
 
-    /// How many times a request is retried at once, on the same server, when
-    /// sending it fails or the server answers 502 or 503 (default 5); see
+    /// How many times a request is sent again to the same server, in all,
+    /// before it fails over (default 3): when sending it fails before it was
+    /// written in full, when the rank's HA client is not ready yet, or when
+    /// the server answers `502`, `503` or `504` without reporting its state;
+    /// see
     /// [`HttpClientConfig::max_retries`](crate::hyper_client::HttpClientConfig::max_retries).
+    /// A `BulkInserter` batch uses the inserter's own
+    /// [`BulkInserterOptions::max_retries`](crate::BulkInserterOptions::max_retries)
+    /// instead.
     pub max_retries: usize,
 
     /// How often, in seconds, to check whether the primary cluster is back
@@ -405,7 +416,7 @@ pub struct KineticaOptions {
 }
 
 /// The default [`KineticaOptions::max_retries`].
-const DEFAULT_HTTP_REQUEST_MAX_RETRIES: usize = 5;
+const DEFAULT_HTTP_REQUEST_MAX_RETRIES: usize = 3;
 
 /// The default [`KineticaOptions::failback_polling_interval`], in seconds.
 const DEFAULT_FAILBACK_POLLING_INTERVAL: u64 = 5;
@@ -535,7 +546,7 @@ impl KineticaOptions {
     }
 
     /// Sets the client program's name and version, reported first in the
-    /// `User-Agent` header. A `None` name clears both. Returns self for method
+    /// `X-Kinetica-Client` header. A `None` name clears both. Returns self for method
     /// chaining.
     pub fn set_client_info(&mut self, client_name: Option<&str>, client_version: Option<&str>) -> &mut Self {
         match client_name {
@@ -778,9 +789,7 @@ const DATABASE_SERVER_VERSION_KEY: &str = "version.gpudb_core_version";
 
 /// Reads the server version from `/show/system/properties`: `A.B.C.D.build`,
 /// split on the first four periods, each of the first four an `i32` and the
-/// rest an `i64`.
-///
-/// A version without a build fails, on the missing fifth component.
+/// rest an `i64`. The build is optional, and 0 where there is none.
 fn parse_server_version(
     system_properties: &HashMap<String, String>,
 ) -> Result<KineticaVersion, KineticaError> {
@@ -803,12 +812,12 @@ fn parse_server_version(
         let minor = int(components[1])?;
         let revision = int(components[2])?;
         let abi_version = int(components[3])?;
-        let build_text = components
-            .get(4)
-            .ok_or_else(|| "no build number after the four version components".to_string())?;
-        let build = build_text
-            .parse::<i64>()
-            .map_err(|_| format!("'{build_text}' is not an i64 build number"))?;
+        let build = match components.get(4) {
+            Some(build_text) => build_text
+                .parse::<i64>()
+                .map_err(|_| format!("'{build_text}' is not an i64 build number"))?,
+            None => 0,
+        };
         Ok(KineticaVersion::with_build(major, minor, revision, abi_version, build))
     };
 
@@ -821,6 +830,24 @@ use crate::address_resolution::{self as resolution, split_dropping_trailing_empt
 fn url_list(urls: &[Url]) -> String {
     let shown: Vec<&str> = urls.iter().map(Url::as_str).collect();
     format!("[{}]", shown.join(", "))
+}
+
+/// Why multi-head is not available on a cluster, for the warning that says
+/// so: the worker addresses it advertises do not answer this client, it
+/// advertises none though multi-head is on at the server, or multi-head is
+/// off at the server.
+fn multi_head_unavailable_reason(has_worker_urls: bool, server_multi_head_enabled: bool) -> String {
+    if has_worker_urls {
+        "its worker addresses are not reachable from this client".to_string()
+    } else if server_multi_head_enabled {
+        format!(
+            "it advertises no worker rank addresses although multi-head is enabled at the server \
+             ({} is not set)",
+            resolution::SYSTEM_PROPERTIES_RESPONSE_SERVER_URLS
+        )
+    } else {
+        "multi-head is off at the server".to_string()
+    }
 }
 
 /// A cluster's multi-head addresses and whether multi-head is usable there,
@@ -1238,71 +1265,29 @@ fn wrapper_schema() -> &'static FastSchema {
     })
 }
 
-// Server messages that mean the cluster cannot serve requests, and so should
-// trigger a failover.
-const DB_OFFLINE_ERROR_MESSAGE: &str = "Kinetica is offline";
-const DB_CONNECTION_RESET_ERROR_MESSAGE: &str = "Connection reset";
-const DB_CONNECTION_REFUSED_ERROR_MESSAGE: &str = "Connection refused";
-const DB_EXITING_ERROR_MESSAGE: &str = "Kinetica is exiting";
-const DB_SHUTTING_DOWN_ERROR_MESSAGE: &str = "System shutting down";
-const DB_DRAINING_HAQ_ERROR_MESSAGE: &str = "Unavailable: Draining HA queue";
-const DB_SYSTEM_LIMITED_ERROR_MESSAGE: &str = "system-limited-fatal";
-const DB_QP_DOWN_ERROR_MESSAGE: &str = "Query planner is not running";
 /// A server error saying the server sent no response, which is taken as an
 /// exit.
 const DB_EOF_FROM_SERVER_ERROR_MESSAGE: &str = "Unexpected end of file from server";
 
-/// Server messages saying a rank is still rebuilding its HA client after its
-/// cluster came back online. The rank refuses the request before handling
-/// it, so nothing was stored and the request can be sent again; the state
-/// clears within seconds. `Draining HA queue` shares their prefix but is a
-/// backlog the cluster must replay first, so it fails over instead.
-const DB_HA_PRODUCER_NOT_READY_MESSAGE: &str = "Unavailable: Producer not available";
-const DB_HA_CONSUMER_NOT_READY_MESSAGE: &str = "Unavailable: Consumer not created";
-
-/// The wait before the first re-send of a request a rank was not ready for;
-/// each later re-send waits twice as long, up to
-/// [`RANK_NOT_READY_MAX_WAIT`].
-const RANK_NOT_READY_FIRST_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
-/// The longest wait before a re-send of a request a rank was not ready for.
-const RANK_NOT_READY_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
-
-/// Whether a server message says the rank's HA client is not ready yet.
-pub(crate) fn is_rank_not_ready_message(message: &str) -> bool {
-    message.contains(DB_HA_PRODUCER_NOT_READY_MESSAGE) || message.contains(DB_HA_CONSUMER_NOT_READY_MESSAGE)
-}
-
-/// Whether `error` is a rank refusing a request because its HA client is not
-/// ready yet: an exit carrying the server's message, which is re-sent to the
-/// same server after [`rank_not_ready_wait`] while the request's retries
-/// last, and fails over after that.
-pub(crate) fn is_rank_not_ready(error: &KineticaError) -> bool {
-    matches!(error, KineticaError::Exit(message) if is_rank_not_ready_message(message))
-}
-
-/// The wait before re-send number `resend` (from 0) of a request a rank was
-/// not ready for: 1 s, then twice as long each time, at most 8 s.
-pub(crate) fn rank_not_ready_wait(resend: usize) -> std::time::Duration {
-    let doublings = u32::try_from(resend).unwrap_or(u32::MAX).min(3);
-    (RANK_NOT_READY_FIRST_WAIT * 2u32.pow(doublings)).min(RANK_NOT_READY_MAX_WAIT)
-}
-
 /// Interprets a response, returning its wrapper or the error it amounts to.
 ///
-/// The error kind decides what happens next. [`KineticaError::Exit`] and
+/// The HTTP layer has already re-sent the request where the reply allowed
+/// it (see [`crate::retry_rules`]), so what is left is to fail over or to
+/// report. The error kind decides which: [`KineticaError::Exit`] and
 /// [`KineticaError::Http`] fail over to another cluster;
 /// [`KineticaError::Unauthorized`] and [`KineticaError::Api`] do not.
 ///
 /// - 401 or 403 is unauthorized.
-/// - A text body (an HTML page from a proxy, say) is an exit on 500, 502, 503
-///   or 504, and a submit failure otherwise.
+/// - A text body (an HTML page from a proxy, say) is decided by its text,
+///   then by its status: an exit where the client fails over from it, and
+///   reported otherwise.
 /// - An empty body is an exit.
-/// - An Avro `ERROR` saying the rank's HA client is not ready is an exit
-///   carrying the server's message, whatever the status, which
-///   [`is_rank_not_ready`] recognizes.
-/// - Any other Avro `ERROR` is an exit if the status is 500, 502, 503 or 504,
-///   or if the message says the server is exiting, offline, shutting down or
-///   draining; otherwise it is an API error.
+/// - An Avro `ERROR` is decided by its message, then by its status: an exit
+///   where it reports the server's state (offline, exiting, shutting down,
+///   draining its HA queue, starting up and the like), a rank not ready or a
+///   rank that failed while handling the request, or the status is `500`,
+///   `502`, `503` or `504`; otherwise an API error, unless it says the
+///   server sent no response, which is an exit.
 /// - A body that is not a valid response is a submit failure.
 fn interpret_response(url: &str, resp: &crate::hyper_client::RawResponse) -> Result<WrapperResponse, KineticaError> {
     let (status, reason) = (resp.status, resp.reason.as_str());
@@ -1311,16 +1296,15 @@ fn interpret_response(url: &str, resp: &crate::hyper_client::RawResponse) -> Res
         return Err(KineticaError::Unauthorized(format!("Server response status: {status} : {reason}")));
     }
 
-    let gateway_or_server_error = matches!(status, 500 | 502 | 503 | 504);
-
     if resp.content_type.as_deref().is_some_and(|ct| ct.starts_with("text")) {
-        if gateway_or_server_error {
-            debug!("Returning an exit error from {url}; response_code: {status}; response message: {reason}");
-            return Err(KineticaError::Exit(reason.to_string()));
-        }
-        return Err(KineticaError::Http(format!(
-            "Cannot parse response from server: '{reason}'; status code: {status}"
-        )));
+        let text = crate::retry_rules::text_reply_message(&resp.body);
+        return Err(crate::retry_rules::reply_failure(
+            url,
+            status,
+            reason,
+            Some(&text),
+            crate::retry_rules::text_reply_description(status, reason),
+        ));
     }
 
     if resp.body.is_empty() {
@@ -1333,50 +1317,20 @@ fn interpret_response(url: &str, resp: &crate::hyper_client::RawResponse) -> Res
     // that this includes a response this client cannot read.
     let wrapper: WrapperResponse = serde_avro_fast::from_datum_slice(&resp.body, wrapper_schema())
         .map_err(|e| KineticaError::Http(format!("Wrapper decode failed: {e}")))?;
-    let message = wrapper.message.as_str();
-
-    // Decided by the message before the status
-    if wrapper.status == "ERROR" && is_rank_not_ready_message(message) {
-        debug!("Returning a rank-not-ready exit error from {url}; response_code: {status}; message: {message}");
-        return Err(KineticaError::Exit(message.to_string()));
-    }
-
-    if status == 400 {
-        if message.contains(DB_SHUTTING_DOWN_ERROR_MESSAGE) {
-            return Err(KineticaError::Exit("Kinetica shutting down".to_string()));
-        }
-        if message.contains(DB_DRAINING_HAQ_ERROR_MESSAGE) {
-            return Err(KineticaError::Exit("Draining HA message queue".to_string()));
-        }
-    }
 
     if wrapper.status == "ERROR" {
-        let server_unavailable = [
-            DB_EXITING_ERROR_MESSAGE,
-            DB_CONNECTION_REFUSED_ERROR_MESSAGE,
-            DB_CONNECTION_RESET_ERROR_MESSAGE,
-            DB_SYSTEM_LIMITED_ERROR_MESSAGE,
-            DB_OFFLINE_ERROR_MESSAGE,
-            DB_QP_DOWN_ERROR_MESSAGE,
-        ]
-        .iter()
-        .any(|m| message.contains(m));
-
-        if status == 500 || status == 504 || server_unavailable {
-            debug!("Returning an exit error from {url}; response_code: {status}; message: {message}");
-            return Err(KineticaError::Exit(message.to_string()));
-        }
-        if status == 502 || status == 503 {
-            debug!("Returning an exit error from {url}; response_code: {status}; message: {message}");
-            return Err(KineticaError::Exit(format!("Cluster may be stopped or suspended: {message}")));
-        }
-        // A legitimate error, unless it says the server did not send a
-        // response, which is an exit and fails over.
-        debug!("Returning an error from {url}; response_code: {status}; message: {message}");
-        if message.contains(DB_EOF_FROM_SERVER_ERROR_MESSAGE) {
-            return Err(KineticaError::Exit(message.to_string()));
-        }
-        return Err(KineticaError::Api(message.to_string()));
+        let message = wrapper.message.as_str();
+        // A gateway or server that could not take the request at the time
+        let unavailable = matches!(status, 502 | 503)
+            && crate::retry_rules::of_reply(status, reason, Some(message)) == crate::retry_rules::Reply::Resend;
+        let description =
+            if unavailable { format!("Cluster may be stopped or suspended: {message}") } else { message.to_string() };
+        return Err(match crate::retry_rules::reply_failure(url, status, reason, Some(message), description) {
+            // A legitimate error, unless it says the server did not send a
+            // response, which is an exit and fails over.
+            KineticaError::Api(m) if m.contains(DB_EOF_FROM_SERVER_ERROR_MESSAGE) => KineticaError::Exit(m),
+            error => error,
+        });
     }
 
     Ok(wrapper)
@@ -1433,8 +1387,9 @@ pub(crate) fn append_path_to_url(url: &Url, path: &str) -> Url {
     appended
 }
 
-/// The headers every request carries: the caller's, the User-Agent among
-/// them, the HA synchronicity override, and the authorization.
+/// The headers every request carries: the caller's, the
+/// `X-Kinetica-Client` among them, the HA synchronicity override, and the
+/// authorization.
 pub(crate) struct HeaderState {
     authorization: Option<String>,
     http_headers: RwLock<HashMap<String, String>>,
@@ -1797,7 +1752,8 @@ impl Kinetica {
         self.options.timeout
     }
 
-    /// How many times a request is retried on the same server.
+    /// How many times a request is sent again to the same server before it
+    /// fails over; see [`KineticaOptions::max_retries`].
     pub fn max_retries(&self) -> usize {
         self.options.max_retries
     }
@@ -1850,16 +1806,17 @@ impl Kinetica {
         env!("GPUDB_API_VERSION")
     }
 
-    /// The additional HTTP headers sent with each request, the `User-Agent`
-    /// among them.
+    /// The additional HTTP headers sent with each request, the
+    /// `X-Kinetica-Client` among them.
     pub fn http_headers(&self) -> HashMap<String, String> {
         self.headers.http_headers.read().clone()
     }
 
     /// Adds an HTTP header sent with each request, replacing one of the same
     /// name. The headers the client sets itself (`Authorization`,
-    /// `Content-type`, `User-Agent`, `X-Kinetica-Group`, `X-Kinetica-Session`)
-    /// cannot be changed.
+    /// `Content-type`, `X-Kinetica-Client`, `X-Kinetica-Group`,
+    /// `X-Kinetica-Session`) cannot be changed; a `User-Agent` can be set as
+    /// any other header.
     pub fn add_http_header(&self, header: &str, value: &str) -> Result<(), KineticaError> {
         if PROTECTED_HEADERS.contains(&header) {
             let message = format!("Not allowed to change protected header: {header}");
@@ -1882,9 +1839,18 @@ impl Kinetica {
         Ok(())
     }
 
-    /// The `User-Agent` header sent with each request.
+    /// The `X-Kinetica-Client` header sent with each request, by which the
+    /// client program and this API identify themselves to the server.
+    pub fn client_header(&self) -> Option<String> {
+        self.headers.http_headers.read().get(HEADER_CLIENT).cloned()
+    }
+
+    /// The value by which this client identifies itself to the server. It is
+    /// sent in the `X-Kinetica-Client` header, not in `User-Agent`; use
+    /// [`Self::client_header`].
+    #[deprecated(since = "7.2.4", note = "use `Kinetica::client_header()`; the value is sent in `X-Kinetica-Client`")]
     pub fn user_agent(&self) -> Option<String> {
-        self.headers.http_headers.read().get(HEADER_USER_AGENT).cloned()
+        self.client_header()
     }
 
     /// The client program's name, from the options.
@@ -2015,7 +1981,7 @@ impl Kinetica {
 
         // The headers, set before any call is made: the caller's, whose Basic
         // credentials and HA synchronicity mode are taken, less the protected
-        // ones, plus the User-Agent
+        // ones, plus the X-Kinetica-Client
         let mut http_headers = options.http_headers.clone();
         let (username, password) =
             credentials_from_http_headers(&http_headers, &options.username, &options.password)?;
@@ -2031,8 +1997,8 @@ impl Kinetica {
         let client_name = options.client_name.clone();
         let client_version = options.client_version.clone();
         http_headers.insert(
-            HEADER_USER_AGENT.to_string(),
-            build_user_agent(client_name.as_deref(), client_version.as_deref()),
+            HEADER_CLIENT.to_string(),
+            build_client_header(client_name.as_deref(), client_version.as_deref()),
         );
 
         // Extract options into struct fields (before moving options)
@@ -3045,6 +3011,7 @@ impl Kinetica {
         // address advertised for it has failed.
         let probed = async {
             let properties = self.get_system_properties_at_url(&head_node_url).await?;
+            let server_multi_head_enabled = resolution::is_multi_head_enabled(&properties);
             let retained = resolution::retain_matching_rank_candidate_urls(
                 &resolution::extract_rank_candidate_urls(&properties),
                 self.hostname_regex.as_ref(),
@@ -3057,17 +3024,21 @@ impl Kinetica {
             } else {
                 None
             };
-            Ok::<_, KineticaError>(
+            Ok::<_, KineticaError>((
+                server_multi_head_enabled,
                 self.probe_rank_candidate_urls(&retained, &rank_host, &head_node_url, reference.as_deref()).await,
-            )
+            ))
         }
         .await;
 
-        let (worker_urls, mut available, probe_decided) = match probed {
-            Ok((available, selected)) => (selected, available, true),
+        // Whether the server has multi-head on at all, for the reason given
+        // when it is found unavailable; assumed where the properties could not
+        // be read
+        let (worker_urls, mut available, probe_decided, server_multi_head_enabled) = match probed {
+            Ok((enabled, (available, selected))) => (selected, available, true, enabled),
             Err(e) => {
                 debug!("Could not refresh worker addresses for cluster <{head_node_url}>: {e}");
-                (held_worker_urls, false, false)
+                (held_worker_urls, false, false, true)
             }
         };
 
@@ -3086,6 +3057,7 @@ impl Kinetica {
             }
         }
 
+        let worker_urls_empty = worker_urls.is_empty();
         {
             // The single publication: a new snapshot carries the addresses and
             // the verdict together, and its identity tells every multi-head
@@ -3104,9 +3076,9 @@ impl Kinetica {
         // double up on every failover onto it.
         if was_available && !available {
             warn!(
-                "Multi-head operations are no longer available on cluster <{head_node_url}>: \
-                 its worker addresses are not reachable from this client. \
-                 Operations will use the head node only."
+                "Multi-head operations are not available on cluster <{head_node_url}>: {}.  \
+                 Operations will use the head node only.",
+                multi_head_unavailable_reason(!worker_urls_empty, server_multi_head_enabled)
             );
         }
 
@@ -3749,8 +3721,6 @@ impl Kinetica {
             KineticaError::Connection("No URL available".to_string())
         })?;
         let original_url = url.clone();
-        // Number of re-sends when a rank was not ready; fail-over resets it.
-        let mut not_ready_resends = 0;
 
         loop {
             // Capture the current cluster switch count before attempting the request
@@ -3769,21 +3739,6 @@ impl Kinetica {
                     return Err(KineticaError::Api(msg));
                 }
 
-                // A rank rebuilding its HA client refused the request before
-                // handling it: wait, then send it to the same server again,
-                // up to max_retries times, before failing over below.
-                Err(error) if is_rank_not_ready(&error) && not_ready_resends < self.max_retries() => {
-                    let wait = rank_not_ready_wait(not_ready_resends);
-                    not_ready_resends += 1;
-                    warn!(
-                        "Endpoint {endpoint} at {url} is not ready: {}; re-sending in {}s (re-send {not_ready_resends} of {})",
-                        error.message(),
-                        wait.as_secs(),
-                        self.max_retries()
-                    );
-                    tokio::time::sleep(wait).await;
-                }
-
                 // A server exiting or a request that could not be sent, or one
                 // that failed on the way: fail over. Note what that implies for
                 // writes: an Http error can come after the server has already
@@ -3800,7 +3755,6 @@ impl Kinetica {
                         Ok(new_url) => {
                             debug!("Switched to {new_url}");
                             url = new_url;
-                            not_ready_resends = 0;
                         }
                         Err(KineticaError::HaUnavailable(ha_msg) | KineticaError::FailoverDisabled(ha_msg)) => {
                             return Err(failover_exhausted(&error, &ha_msg));
@@ -3863,17 +3817,18 @@ impl Kinetica {
     }
 
     /// Sends a request body that is already encoded, and compressed if
-    /// `snappy`, directly to `url` without HA failover, and reads the response
-    /// as [`Self::submit_request_raw`] does.
+    /// `snappy`, directly to `url` without HA failover, re-sent as `retries`
+    /// allows, and reads the response as [`Self::submit_request_raw`] does.
     pub(crate) async fn submit_encoded_request_raw<Resp: DeserializeOwned>(
         &self,
         url: &str,
         body: hyper::body::Bytes,
         snappy: bool,
         resp_schema: &FastSchema,
+        retries: &crate::retry_rules::RequestRetries,
     ) -> Result<Resp, KineticaError> {
         trace!("Submitting request to {url}; payload size: {} bytes (snappy={snappy})", body.len());
-        let resp = self.hyper_client.post_encoded_raw(url, body, snappy, &self.request_headers()).await?;
+        let resp = self.hyper_client.post_encoded_raw(url, body, snappy, &self.request_headers(), retries).await?;
         self.read_response(url, &resp, resp_schema)
     }
 
@@ -4309,14 +4264,17 @@ mod response_classification_tests {
     fn a_server_that_cannot_serve_is_an_exit() {
         for message in [
             "Kinetica is exiting",
-            "Connection refused",
-            "Connection reset by peer",
             "Error: system-limited-fatal",
             "Kinetica is offline",
             "Query planner is not running",
         ] {
             let err = classify(200, OCTET, avro("ERROR", message)).unwrap_err();
             assert!(matches!(err, KineticaError::Exit(_)), "{message}: {err:?}");
+        }
+        // A server's own failure to connect elsewhere is no state of its own
+        for message in ["Connection refused", "Connection reset by peer"] {
+            let err = classify(200, OCTET, avro("ERROR", message)).unwrap_err();
+            assert!(matches!(err, KineticaError::Api(_)), "{message}: {err:?}");
         }
     }
 
@@ -4335,47 +4293,69 @@ mod response_classification_tests {
         }
     }
 
+    // Every server state is an exit carrying the server's message, whatever
+    // the status: shutting down, draining, starting up and the rest.
     #[test]
-    fn a_shutting_down_or_draining_bad_request_is_an_exit() {
-        let err = classify(400, OCTET, avro("ERROR", "System shutting down")).unwrap_err();
-        assert!(matches!(err, KineticaError::Exit(ref m) if m == "Kinetica shutting down"), "{err:?}");
-        let err = classify(400, OCTET, avro("ERROR", "Unavailable: Draining HA queue")).unwrap_err();
-        assert!(matches!(err, KineticaError::Exit(ref m) if m == "Draining HA message queue"), "{err:?}");
+    fn a_server_state_is_an_exit_whatever_the_status() {
+        for message in [
+            "System shutting down",
+            "Unavailable: Draining HA queue",
+            "Kinetica is starting up",
+            "Kinetica is restricted to admin users only",
+            "Kinetica is currently unable to process this message",
+            "Query planner is not running",
+        ] {
+            for status in [200, 400] {
+                let err = classify(status, OCTET, avro("ERROR", message)).unwrap_err();
+                assert!(matches!(err, KineticaError::Exit(ref m) if m == message), "{status} {message}: {err:?}");
+            }
+        }
+        // A 503 for a server state is not "stopped or suspended"
+        let err = classify(503, OCTET, avro("ERROR", "Kinetica is offline")).unwrap_err();
+        assert!(matches!(err, KineticaError::Exit(ref m) if m == "Kinetica is offline"), "{err:?}");
     }
 
-    // A rank whose HA client is not ready is an exit carrying the server's
-    // message, whatever the status, and is recognized for a re-send; a
-    // draining HA queue, which shares the prefix, is not.
+    // A rank whose HA client is not ready, or one that failed while handling
+    // the request, is an exit carrying the server's message, whatever the
+    // status.
     #[test]
-    fn a_rank_not_ready_is_an_exit_whatever_the_status() {
-        for message in ["[HA] Unavailable: Producer not available", "[HA] Unavailable: Consumer not created"] {
+    fn a_rank_not_ready_or_failing_is_an_exit_whatever_the_status() {
+        for message in [
+            "[HA] Unavailable: Producer not available",
+            "[HA] Unavailable: Consumer not created",
+            "Rank 2 non-responsive",
+            "Failed to send insert request to other rank",
+        ] {
             for status in [200, 400, 500] {
                 let err = classify(status, OCTET, avro("ERROR", message)).unwrap_err();
                 assert!(matches!(err, KineticaError::Exit(ref m) if m == message), "{status}: {err:?}");
-                assert!(is_rank_not_ready(&err), "{status}: {err:?}");
             }
         }
-        let draining = classify(400, OCTET, avro("ERROR", "[HA] Unavailable: Draining HA queue")).unwrap_err();
-        assert!(!is_rank_not_ready(&draining), "{draining:?}");
-        assert!(!is_rank_not_ready(&KineticaError::Api("[HA] Unavailable: Producer not available".into())));
+    }
+
+    // Reaching a host manager other than the head's is the caller's to fix,
+    // whatever the status.
+    #[test]
+    fn a_head_host_manager_only_reply_is_reported() {
+        for status in [400, 500, 503] {
+            let err = classify(status, OCTET, avro("ERROR", "only accessible from head host manager")).unwrap_err();
+            assert!(matches!(err, KineticaError::Api(_)), "{status}: {err:?}");
+        }
     }
 
     #[test]
-    fn a_rank_not_ready_waits_one_second_doubling_to_eight() {
-        let waits: Vec<u64> = (0..7).map(|resend| rank_not_ready_wait(resend).as_secs()).collect();
-        assert_eq!(waits, [1, 2, 4, 8, 8, 8, 8]);
-        assert_eq!(rank_not_ready_wait(usize::MAX).as_secs(), 8);
-    }
-
-    #[test]
-    fn a_text_body_is_an_exit_on_server_errors_and_a_submit_failure_otherwise() {
+    fn a_text_body_is_an_exit_on_server_errors_and_reported_otherwise() {
         let html = Bytes::from_static(b"<html>Bad Gateway</html>");
         for status in [500, 502, 503, 504] {
             let err = classify(status, Some("text/html"), html.clone()).unwrap_err();
             assert!(matches!(err, KineticaError::Exit(_)), "{status}: {err:?}");
         }
+        // Reported: another attempt or cluster gives the same answer
         let err = classify(404, Some("text/html"), html).unwrap_err();
-        assert!(matches!(err, KineticaError::Http(ref m) if m.contains("status code: 404")), "{err:?}");
+        assert!(matches!(err, KineticaError::Api(ref m) if m.contains("status code: 404")), "{err:?}");
+        // Unless its text reports the server's state
+        let err = classify(200, Some("text/plain"), Bytes::from_static(b"Kinetica is offline")).unwrap_err();
+        assert!(matches!(err, KineticaError::Exit(_)), "{err:?}");
     }
 
     #[test]
@@ -4626,6 +4606,15 @@ mod server_version_tests {
         assert_eq!(v.full_version(), "7.2.3.27.20261002123456");
     }
 
+    // A version without a build number, as some servers report, has a build
+    // of 0.
+    #[test]
+    fn a_version_without_a_build_number_is_read() {
+        let v = parsed("7.2.3.25").unwrap();
+        assert_eq!(v, KineticaVersion::new(7, 2, 3, 25));
+        assert_eq!((v.build(), v.to_string()), (0, "7.2.3.25".to_string()));
+    }
+
     #[test]
     fn a_malformed_version_fails() {
         assert_eq!(
@@ -4637,10 +4626,10 @@ mod server_version_tests {
             "API error: Could not parse server version; error: Server version string in \
              /show/system/properties response malformed (expected at least four components): 7.2.3"
         );
-        // The build is needed too: a fifth component, read as an i64.
+        // A build, where there is one, is read as an i64
         assert_eq!(
-            parsed("7.2.3.27").unwrap_err(),
-            "API error: Could not parse server version; error: no build number after the four version components"
+            parsed("7.2.3.27.").unwrap_err(),
+            "API error: Could not parse server version; error: '' is not an i64 build number"
         );
         assert_eq!(
             parsed("7.x.3.27.1").unwrap_err(),
@@ -4912,7 +4901,8 @@ mod header_tests {
 
     // On connecting, the caller's headers are sent, Basic credentials among
     // them are used, X-Kinetica-Group names the sync mode, the protected
-    // headers are dropped, and the User-Agent names the client program first.
+    // headers are dropped, and the X-Kinetica-Client names the client program
+    // first. A User-Agent is the caller's to set, as any other header.
     // An X-Kinetica-Group header of the mode's wire value sets the mode, which
     // goes out as that value.
     #[tokio::test]
@@ -4940,7 +4930,8 @@ mod header_tests {
             .add_http_header("X-Custom", "1")
             .add_http_header("Authorization", "Basic dXNlcjpwYXNz")
             .add_http_header("X-Kinetica-Group", "SYNCHRONOUS")
-            .add_http_header("User-Agent", "fake")
+            .add_http_header("User-Agent", "MyApp/1.0")
+            .add_http_header("X-Kinetica-Client", "fake")
             .add_http_header("Content-type", "text/plain");
 
         let k = Kinetica::new(vec![server.url.to_string()], options).await.expect("client");
@@ -4950,10 +4941,14 @@ mod header_tests {
         assert_eq!(header(&head, "Authorization").as_deref(), Some("Basic dXNlcjpwYXNz"), "the header's credentials");
         assert_eq!(header(&head, "X-Kinetica-Group").as_deref(), Some("REPL_SYNC"));
         assert_eq!(header(&head, "Content-type").as_deref(), Some("application/octet-stream"));
-        let user_agent = header(&head, "User-Agent").unwrap();
+        assert_eq!(header(&head, "User-Agent").as_deref(), Some("MyApp/1.0"), "the caller's, as given");
+        let client = header(&head, "X-Kinetica-Client").unwrap();
         let expected = format!("My_App/1.0 kinetica-api-rust/{} (Rust/", env!("GPUDB_API_VERSION"));
-        assert!(user_agent.starts_with(&expected), "{user_agent}");
-        assert_eq!(k.user_agent().as_deref(), Some(user_agent.as_str()));
+        assert!(client.starts_with(&expected), "{client}");
+        assert_eq!(k.client_header().as_deref(), Some(client.as_str()));
+        #[allow(deprecated)]
+        let user_agent = k.user_agent();
+        assert_eq!(user_agent, k.client_header(), "the deprecated name answers with the new header's value");
         assert_eq!(k.client_name(), Some("My App"));
         assert_eq!(k.ha_sync_mode(), HaSynchronicityMode::Synchronous);
 
@@ -4962,23 +4957,30 @@ mod header_tests {
         assert_eq!(k.primary_hostname(), "127.0.0.95");
         assert_eq!(k.system_properties().get("conf.number_of_hosts").map(String::as_str), Some("1"));
         // The crate's SemVer version, with no build number, and the same in
-        // the User-Agent; the build number is the time of the build
+        // the X-Kinetica-Client; the build number is the time of the build
         assert_eq!(Kinetica::api_version(), env!("CARGO_PKG_VERSION"));
         assert!(Kinetica::api_version().split('.').count() == 3, "MAJOR.MINOR.PATCH: {}", Kinetica::api_version());
-        assert_eq!(env!("GPUDB_API_VERSION"), env!("CARGO_PKG_VERSION"), "the User-Agent's version");
+        assert_eq!(env!("GPUDB_API_VERSION"), env!("CARGO_PKG_VERSION"), "the X-Kinetica-Client's version");
         let build = env!("GPUDB_API_BUILD_NUMBER");
         assert!(build.len() == 14 && build.bytes().all(|b| b.is_ascii_digit()), "%Y%m%d%H%M%S: {build}");
 
         let headers = k.http_headers();
         let mut names: Vec<&str> = headers.keys().map(String::as_str).collect();
         names.sort_unstable();
-        assert_eq!(names, ["User-Agent", "X-Custom"]);
+        assert_eq!(names, ["User-Agent", "X-Custom", "X-Kinetica-Client"]);
 
         // Changing headers at run time, except for the protected ones
         assert_eq!(
-            k.add_http_header("User-Agent", "x").unwrap_err().to_string(),
-            "API error: Not allowed to change protected header: User-Agent"
+            k.add_http_header("X-Kinetica-Client", "x").unwrap_err().to_string(),
+            "API error: Not allowed to change protected header: X-Kinetica-Client"
         );
+        assert_eq!(
+            k.remove_http_header("X-Kinetica-Client").unwrap_err().to_string(),
+            "API error: Not allowed to remove protected header: X-Kinetica-Client"
+        );
+        k.add_http_header("User-Agent", "Other/2").unwrap();
+        assert_eq!(k.http_headers()["User-Agent"], "Other/2");
+        k.remove_http_header("User-Agent").unwrap();
         assert_eq!(
             k.remove_http_header("Authorization").unwrap_err().to_string(),
             "API error: Not allowed to remove protected header: Authorization"
@@ -5028,14 +5030,14 @@ mod header_tests {
     }
 
     #[test]
-    fn the_user_agent_names_the_client_and_version() {
-        assert_eq!(sanitize_user_agent_token("My App/1.0"), "My_App_1.0");
-        assert_eq!(sanitize_user_agent_token(""), "unknown");
-        let user_agent = build_user_agent(Some("app"), None);
+    fn the_client_header_names_the_client_and_version() {
+        assert_eq!(sanitize_client_token("My App/1.0"), "My_App_1.0");
+        assert_eq!(sanitize_client_token(""), "unknown");
+        let client = build_client_header(Some("app"), None);
         let expected = format!("app {USER_AGENT_PROGRAM_NAME}/{} (Rust/", env!("GPUDB_API_VERSION"));
-        assert!(user_agent.starts_with(&expected), "{user_agent}");
-        assert!(user_agent.ends_with(')'));
-        assert!(build_user_agent(Some(""), Some("1")).starts_with(USER_AGENT_PROGRAM_NAME), "an empty name is no name");
+        assert!(client.starts_with(&expected), "{client}");
+        assert!(client.ends_with(')'));
+        assert!(build_client_header(Some(""), Some("1")).starts_with(USER_AGENT_PROGRAM_NAME), "an empty name is no name");
     }
 }
 
@@ -5302,6 +5304,61 @@ mod connection_tests {
         // The same worker reporting the head's cluster answers
         *other.behavior.properties.lock() = head.behavior.properties.lock().clone();
         assert!(k.probe_current_cluster_multi_head().await);
+    }
+
+    /// Losing multi-head on a cluster is logged with its cause: worker
+    /// addresses that do not answer, none advertised though multi-head is on
+    /// at the server, or multi-head off at the server.
+    #[test]
+    fn losing_multi_head_logs_why() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (causes, records) = crate::test_log::capture(|| {
+            runtime.block_on(async {
+                let head = fake_server::start("127.0.0.246").await;
+                let worker = fake_server::start("127.0.0.247").await;
+                let mut available = cluster_properties(&address(&head), &[&address(&worker)]);
+                available.insert("conf.ring_name".into(), "ring-a".into());
+                *head.behavior.properties.lock() = available.clone();
+                *worker.behavior.properties.lock() = available.clone();
+                let k = Kinetica::new(vec![head.url.to_string()], options()).await.expect("client");
+
+                // The worker answers for another cluster
+                let mut elsewhere = available.clone();
+                elsewhere.insert("conf.ring_name".into(), "ring-b".into());
+                let mut none_advertised = available.clone();
+                none_advertised.remove("conf.worker_http_server_urls");
+                let mut off = none_advertised.clone();
+                off.insert("conf.enable_worker_http_servers".into(), "FALSE".into());
+
+                let mut causes = Vec::new();
+                for (head_lost, worker_lost) in
+                    [(available.clone(), elsewhere), (none_advertised, available.clone()), (off, available.clone())]
+                {
+                    *head.behavior.properties.lock() = available.clone();
+                    *worker.behavior.properties.lock() = available.clone();
+                    assert!(k.probe_current_cluster_multi_head().await, "available again");
+                    *head.behavior.properties.lock() = head_lost;
+                    *worker.behavior.properties.lock() = worker_lost;
+                    causes.push(k.probe_current_cluster_multi_head().await);
+                }
+                causes
+            })
+        });
+        assert_eq!(causes, [false, false, false]);
+        let warnings: Vec<&String> =
+            records.iter().filter(|(level, _)| *level == log::Level::Warn).map(|(_, message)| message).collect();
+        let lost: Vec<&&String> = warnings.iter().filter(|w| w.starts_with("Multi-head operations are not available")).collect();
+        assert_eq!(lost.len(), 3, "{warnings:?}");
+        assert!(lost[0].contains(": its worker addresses are not reachable from this client.  "), "{}", lost[0]);
+        assert!(
+            lost[1].contains(
+                ": it advertises no worker rank addresses although multi-head is enabled at the server \
+                 (conf.worker_http_server_urls is not set).  "
+            ),
+            "{}",
+            lost[1]
+        );
+        assert!(lost[2].contains(": multi-head is off at the server.  "), "{}", lost[2]);
     }
 
     /// The host manager address an operator published for the head's host is
@@ -5637,7 +5694,9 @@ mod session_tests {
         // After the caller's headers, and before the group and authorization
         let position = |name: &str| head.find(&format!("\n{name}:")).or_else(|| head.find(&format!("\n{}:", name.to_lowercase())));
         let session = position("X-Kinetica-Session").unwrap();
-        assert!(position("User-Agent").unwrap() < session && session < position("Authorization").unwrap(), "{head}");
+        assert!(position("X-Kinetica-Client").unwrap() < session && session < position("Authorization").unwrap(), "{head}");
+        // No User-Agent unless the caller sets one: the HTTP client sends none
+        assert_eq!(position("User-Agent"), None, "{head}");
 
         // On every request, the ping included
         k.has_table("t".into()).await.unwrap();

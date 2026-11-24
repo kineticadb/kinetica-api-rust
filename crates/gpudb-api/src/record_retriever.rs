@@ -237,13 +237,11 @@ fn had_connection_failure(error: &KineticaError) -> bool {
 }
 
 /// Whether a failed look-up should fail over to another cluster: a server
-/// exit or a connection failure.
-///
-/// `Http` is deliberately not included: a submit failure does not fail over.
-/// See `is_connection_error` in the bulk inserter, which makes the same
-/// distinction.
+/// exit, a connection failure, or an HTTP error, such as a request written in
+/// full whose response was lost. A look-up changes nothing, so trying it again
+/// on another cluster is safe.
 fn is_failover_trigger(error: &KineticaError) -> bool {
-    matches!(error, KineticaError::Exit(_)) || had_connection_failure(error)
+    matches!(error, KineticaError::Exit(_) | KineticaError::Http(_)) || had_connection_failure(error)
 }
 
 /// Object that permits efficient retrieval of records from GPUdb, with support
@@ -296,7 +294,10 @@ pub struct RecordRetriever<R = GenericRecord> {
     /// published yet. Only touched while holding `monitor`.
     pending_routing_table: parking_lot::Mutex<Option<Vec<i32>>>,
     current_head_node_url: RwLock<Option<Url>>,
-    last_used_url: RwLock<Option<Url>>,
+    /// Mixed with a replicated table's lookup expression to choose its worker
+    /// rank: drawn once per retriever, so this retriever keeps an expression
+    /// on one rank and different retrievers spread it over the ranks.
+    rank_salt: u64,
 
     /// The records this retriever returns.
     records: PhantomData<fn() -> R>,
@@ -501,7 +502,7 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
             monitor: tokio::sync::Mutex::new(()),
             pending_routing_table: parking_lot::Mutex::new(None),
             current_head_node_url: RwLock::new(current_head_node_url),
-            last_used_url: RwLock::new(None),
+            rank_salt: rand::rng().random(),
             records: PhantomData,
         };
 
@@ -773,17 +774,11 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
         routing: &RetrieverRouting,
         key_values: &[ShardKeyValue<'_>],
         expression: Option<&str>,
-        offset: i64,
         check_expression_for_replicated: bool,
     ) -> Result<(bool, Option<String>, bool), KineticaError> {
         let mut do_worker_lookup = routing.multi_head_enabled;
         let mut composite_expression = expression.map(str::to_string);
         let key_values_specified = !key_values.is_empty();
-
-        // A new query (not a later page) may go to another worker
-        if offset < 1 {
-            *self.last_used_url.write() = None;
-        }
 
         if !key_values_specified {
             // Use head rank if table is [randomly] sharded and no keys are given,
@@ -956,6 +951,85 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
         expression: Option<&str>,
         offset: i64,
     ) -> Result<GetRecordsResponse<R>, KineticaError> {
+        self.get_by_key_page(key_values, expression, offset, END_OF_SET, None).await
+    }
+
+    /// Makes a lookup whose records are read a page at a time; see
+    /// [`Lookup`]. The lookup is made here and sent when it is read.
+    ///
+    /// # Arguments
+    ///
+    /// * `key_values` - The key values to use for the lookup, as for
+    ///   [`get_by_key`](Self::get_by_key), or none
+    /// * `expression` - A filter expression applied to the records the key
+    ///   values select, or to the whole table
+    /// * `page_size` - How many records to read from the server at a time,
+    ///   or 0 for the server's own page size
+    ///
+    /// # Errors
+    ///
+    /// Fails if the lookup is on a replicated table, would go to a worker
+    /// rank, and no worker rank is live.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use gpudb_api::*;
+    /// # async fn example(retriever: RecordRetriever) -> Result<(), KineticaError> {
+    /// let mut lookup = retriever.lookup(&[], Some("id > 100"), 1000)?;
+    /// println!("{} records", lookup.size().await?);
+    /// while let Some(record) = lookup.next().await? {
+    ///     println!("{record:?}");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn lookup<'k>(
+        &self,
+        key_values: &[ShardKeyValue<'k>],
+        expression: Option<&str>,
+        page_size: i64,
+    ) -> Result<Lookup<'_, 'k, R>, KineticaError> {
+        let routing = self.routing.load_full();
+        // The pages of a replicated table must all come from one rank, as each
+        // holds the table in its own order; drawn at random per lookup, so
+        // lookups spread over the ranks
+        let replicated_worker_lookup = routing.multi_head_enabled
+            && self.table_replicated
+            && (!key_values.is_empty() || expression.is_some_and(|e| !e.is_empty()));
+        let worker = if replicated_worker_lookup {
+            Some(Self::live_worker_url_for(&routing, rand::rng().random(), "")?)
+        } else {
+            None
+        };
+        Ok(Lookup {
+            retriever: self,
+            key_values: key_values.to_vec(),
+            expression: expression.map(str::to_string),
+            page_size: if page_size > 0 { page_size } else { END_OF_SET },
+            routing,
+            worker,
+            page: std::collections::VecDeque::new(),
+            offset: 0,
+            started: false,
+            more: true,
+            total: -1,
+        })
+    }
+
+    /// Retrieves up to `limit` records from `offset`, as
+    /// [`get_by_key_with_offset`](Self::get_by_key_with_offset) does. With a
+    /// `pinned` worker, a lookup that goes to a worker goes to that one, and a
+    /// failure that would be retried after recovery fails instead: the page
+    /// cannot come from another rank.
+    async fn get_by_key_page(
+        &self,
+        key_values: &[ShardKeyValue<'_>],
+        expression: Option<&str>,
+        offset: i64,
+        limit: i64,
+        pinned: Option<&Url>,
+    ) -> Result<GetRecordsResponse<R>, KineticaError> {
         // Take the routing state once and route this lookup entirely from that
         // snapshot. A rebuild running concurrently publishes a new one; this
         // lookup then goes wherever the state it was routed against said, which
@@ -965,7 +1039,7 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
         let routing = self.routing.load_full();
 
         let (do_worker_lookup, composite_expression, key_values_specified) =
-            self.prepare_retrieval_params(&routing, key_values, expression, offset, true)?;
+            self.prepare_retrieval_params(&routing, key_values, expression, true)?;
 
         // Create the options for the key lookup; first include general options
         let mut retrieval_options = self.options.read().clone();
@@ -983,7 +1057,7 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
         let request = GetRecordsRequest {
             table_name: self.table_name.clone(),
             offset,
-            limit: END_OF_SET,
+            limit,
             encoding: "binary".to_string(),
             options: retrieval_options,
         };
@@ -993,7 +1067,7 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
         let current_count_cluster_switches = self.current_cluster_switch_count();
 
         let result = self
-            .try_get_by_key(&routing, do_worker_lookup, key_values, &request, composite_expression.as_deref())
+            .try_get_by_key(&routing, do_worker_lookup, key_values, &request, composite_expression.as_deref(), pinned)
             .await;
 
         match result {
@@ -1011,24 +1085,33 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
                     .await?;
 
                 if should_retry {
-                    // Retried, with two known risks:
+                    // A pinned page cannot be retried: the routing it was
+                    // pinned against is gone, and a page from another rank
+                    // could repeat or skip records
+                    if let Some(worker) = pinned {
+                        return Err(KineticaError::caused(
+                            format!(
+                                "The lookup cannot go on from rank <{worker}> after a change of cluster or shard \
+                                 mapping: {}",
+                                e.message()
+                            ),
+                            e,
+                        ));
+                    }
+                    // Retried for the same page: the same offset, and the
+                    // original expression rather than the composite one, which
+                    // the retry builds again from the routing then in force.
                     //
-                    // - The retry is
-                    //   `get_by_key_with_offset(key_values, expression, 0)`,
-                    //   which starts again from offset 0: a failed read of a
-                    //   later page is answered with the first page. The
-                    //   original expression is reused, not the composite one.
-                    // - Nothing bounds the number of retries. Each one is a
-                    //   whole new attempt with its own recovery, so a cluster
-                    //   that keeps failing over successfully, or a shard
-                    //   mapping that keeps changing, retries again. The
-                    //   recursion is boxed, so it grows the heap rather than
-                    //   the stack.
+                    // Nothing bounds the number of retries. Each one is a
+                    // whole new attempt with its own recovery, so a cluster
+                    // that keeps failing over successfully, or a shard mapping
+                    // that keeps changing, retries again. The recursion is
+                    // boxed, so it grows the heap rather than the stack.
                     //
                     // Keep the original failure if the retry also fails. It is the
                     // diagnosis; the retry's own failure is usually a consequence
                     // of it, and replacing it loses the only useful message.
-                    return Box::pin(self.get_by_key_with_offset(key_values, expression, 0))
+                    return Box::pin(self.get_by_key_page(key_values, expression, offset, limit, None))
                         .await
                         .map_err(|retry_err| {
                             KineticaError::caused(
@@ -1057,13 +1140,17 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
         key_values: &[ShardKeyValue<'_>],
         request: &GetRecordsRequest,
         composite_expression: Option<&str>,
+        pinned: Option<&Url>,
     ) -> Result<GetRecordsResponse<R>, KineticaError> {
         let expression_text = composite_expression.unwrap_or("null");
         let response = if !do_worker_lookup {
             debug!("Retrieving records from rank-0 with <{expression_text}>");
             self.kinetica.get_records_raw(request).await?
         } else {
-            let url = self.select_worker_url(routing, key_values)?;
+            let url = match pinned {
+                Some(worker) => worker.clone(),
+                None => self.select_worker_url(routing, key_values, composite_expression)?,
+            };
             debug!("Retrieving records from <{url}> with <{expression_text}>");
             self.kinetica.get_records_from_url(url.as_str(), request).await?
         };
@@ -1194,7 +1281,7 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
         let routing = self.routing.load_full();
 
         let (do_worker_lookup, composite_expression, _) =
-            self.prepare_retrieval_params(&routing, key_values, expression, offset, false)?;
+            self.prepare_retrieval_params(&routing, key_values, expression, false)?;
 
         // Create the options for the key lookup; first include general options
         let mut retrieval_options = self.options.read().clone();
@@ -1236,15 +1323,14 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
                     .await?;
 
                 if should_retry {
-                    // Retried from offset 0 and without a bound; see the
-                    // matching note in get_by_key_with_offset for the risks
-                    // that carries. Keep the original failure if the retry also
-                    // fails.
+                    // Retried for the same page, and without a bound; see the
+                    // matching note in get_by_key_with_offset. Keep the
+                    // original failure if the retry also fails.
                     return Box::pin(self.by_column(
                         request.column_names,
                         key_values,
                         expression,
-                        0,
+                        offset,
                         encoding,
                         finish,
                     ))
@@ -1277,7 +1363,7 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
             debug!("Retrieving records from rank-0 with <{expression_text}>");
             self.kinetica.get_records_by_column_raw(request).await?
         } else {
-            let url = self.select_worker_url(routing, key_values)?;
+            let url = self.select_worker_url(routing, key_values, composite_expression)?;
             debug!("Retrieving records from <{url}/bycolumn> with <{expression_text}>");
             let bycolumn_url = crate::gpudb::append_path_to_url(&url, "/bycolumn").to_string();
             self.kinetica.get_records_by_column_from_url(&bycolumn_url, request).await?
@@ -1294,24 +1380,22 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
 
     // ==================== Helper Methods ====================
 
-    /// Selects the worker to look up on: any live one for a replicated table,
-    /// keeping it for later pages, and otherwise the one owning the key's
-    /// shard.
+    /// Selects the worker to look up on: for a replicated table, the one this
+    /// retriever chooses for `expression`, and otherwise the one owning the
+    /// key's shard.
     fn select_worker_url(
         &self,
         routing: &RetrieverRouting,
         key_values: &[ShardKeyValue<'_>],
+        expression: Option<&str>,
     ) -> Result<Url, KineticaError> {
         if self.table_replicated {
-            // For replicated tables, use the same worker for new pages (i.e.,
-            // offset > 0) in case the data is in a different order on
-            // different workers
-            if let Some(url) = self.last_used_url.read().clone() {
-                return Ok(url);
-            }
-            let url = Self::random_live_worker_url(routing)?;
-            *self.last_used_url.write() = Some(url.clone());
-            return Ok(url);
+            // Each rank holds a replicated table in an order of its own, so the
+            // pages of a lookup must all come from one rank, or they could
+            // repeat or skip records. The rank is chosen by the expression,
+            // not remembered from the last call, so another lookup or task in
+            // between cannot move a lookup's later pages elsewhere.
+            return Self::live_worker_url_for(routing, self.rank_salt, expression.unwrap_or(""));
         }
 
         // Not a replicated table; so calculate the shard to figure out which
@@ -1342,9 +1426,10 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
         Self::live_worker_url(routing, shard_key.route(routing_table) as isize)
     }
 
-    /// Returns the URL of a randomly chosen live worker rank, for lookups that
-    /// are not routed by a shard key.
-    fn random_live_worker_url(routing: &RetrieverRouting) -> Result<Url, KineticaError> {
+    /// Returns the URL of the live worker rank chosen for `expression` with
+    /// `salt`, for lookups that are not routed by a shard key: the same rank
+    /// for the same salt and expression while the live ranks stay the same.
+    fn live_worker_url_for(routing: &RetrieverRouting, salt: u64, expression: &str) -> Result<Url, KineticaError> {
         if routing.live_worker_indices.is_empty() {
             return Err(KineticaError::Api(format!(
                 "No live worker rank is available for record retrieval; all {} \
@@ -1353,7 +1438,7 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
             )));
         }
 
-        let idx = rand::rng().random_range(0..routing.live_worker_indices.len());
+        let idx = rank_choice(salt, expression, routing.live_worker_indices.len());
         Ok(routing.worker_urls[routing.live_worker_indices[idx]]
             .as_ref()
             .expect("live_worker_indices only names occupied slots")
@@ -1379,6 +1464,106 @@ impl<R: RetrievedRecord> RecordRetriever<R> {
         }
     }
 }
+
+/// The records one lookup matches, read from the server a page at a time in a
+/// single pass; made by [`RecordRetriever::lookup`].
+///
+/// On a replicated table every page is taken from one worker rank, drawn at
+/// random when the lookup is made: each rank holds the whole table in an order
+/// of its own, so a page from another rank could repeat or skip records. If
+/// the cluster or the shard mapping changes during the pass (the rank leaving
+/// the cluster, a fail-over, a new shard mapping), the lookup fails rather
+/// than go on from another rank. A lookup routed by key, or through the head
+/// node, reads each page as [`RecordRetriever::get_by_key_with_offset`] does,
+/// recovering as it does.
+///
+/// [`size`](Self::size) is the number of records the lookup matches, known
+/// once its first page has been read; asking for it reads that page.
+pub struct Lookup<'a, 'k, R = GenericRecord> {
+    retriever: &'a RecordRetriever<R>,
+    key_values: Vec<ShardKeyValue<'k>>,
+    expression: Option<String>,
+    page_size: i64,
+    /// The routing the lookup was made against, which a pinned lookup must
+    /// still be reading from
+    routing: Arc<RetrieverRouting>,
+    /// The rank every page comes from, for a lookup on a replicated table
+    worker: Option<Url>,
+    page: std::collections::VecDeque<R>,
+    offset: i64,
+    started: bool,
+    more: bool,
+    total: i64,
+}
+
+impl<R: RetrievedRecord> Lookup<'_, '_, R> {
+    /// How many records the lookup matches in all; reads the first page if
+    /// none has been read.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the page cannot be read.
+    pub async fn size(&mut self) -> Result<i64, KineticaError> {
+        if !self.started {
+            self.read_page().await?;
+        }
+        Ok(self.total)
+    }
+
+    /// The next record, reading the next page once the last is used up, or
+    /// `None` after the last record.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a page cannot be read, or if the lookup is on a replicated
+    /// table and the cluster or shard mapping changed during it.
+    pub async fn next(&mut self) -> Result<Option<R>, KineticaError> {
+        if self.page.is_empty() && (!self.started || self.more) {
+            self.read_page().await?;
+        }
+        Ok(self.page.pop_front())
+    }
+
+    async fn read_page(&mut self) -> Result<(), KineticaError> {
+        if let Some(worker) = &self.worker {
+            if !Arc::ptr_eq(&self.retriever.routing.load_full(), &self.routing) {
+                return Err(KineticaError::Api(format!(
+                    "The lookup cannot go on from rank <{worker}>: the cluster or shard mapping changed during it"
+                )));
+            }
+        }
+        let response = self
+            .retriever
+            .get_by_key_page(&self.key_values, self.expression.as_deref(), self.offset, self.page_size, self.worker.as_ref())
+            .await?;
+        let read = response.data.len() as i64;
+        self.started = true;
+        self.offset += read;
+        self.total = response.total_number_of_records;
+        self.more = read > 0 && (response.has_more_records || self.offset < self.total);
+        debug!(
+            "Lookup page of {read} record(s) at offset {}; has_more_records={}, total={}, from {}",
+            self.offset - read,
+            response.has_more_records,
+            self.total,
+            self.worker.as_ref().map_or("the routing of each page".to_string(), Url::to_string)
+        );
+        self.page = response.data.into();
+        Ok(())
+    }
+}
+
+/// The index, below `count`, of the rank a replicated-table lookup with
+/// `expression` goes to, for a retriever whose salt is `salt`.
+fn rank_choice(salt: u64, expression: &str, count: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+    // SipHash with fixed keys: the same input chooses the same rank
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    salt.hash(&mut hasher);
+    expression.hash(&mut hasher);
+    (hasher.finish() % count as u64) as usize
+}
+
 
 /// Types a by-column response by the dynamic schema it carries, which is what
 /// [`RecordRetriever::get_columns_by_key`] returns.
@@ -1414,6 +1599,20 @@ fn now_millis() -> i64 {
 mod tests {
     use super::*;
 
+    // A replicated-table lookup's rank depends only on the retriever's salt
+    // and the expression: one retriever keeps an expression on one rank, and
+    // expressions, and retrievers, spread over the ranks.
+    #[test]
+    fn a_replicated_lookups_rank_follows_its_expression() {
+        assert_eq!(rank_choice(7, "id > 0", 4), rank_choice(7, "id > 0", 4));
+        let by_expression: std::collections::HashSet<usize> =
+            (0..64).map(|i| rank_choice(7, &format!("id > {i}"), 4)).collect();
+        assert!(by_expression.len() > 1, "expressions spread over the ranks: {by_expression:?}");
+        let by_salt: std::collections::HashSet<usize> = (0..64).map(|salt| rank_choice(salt, "id > 0", 4)).collect();
+        assert!(by_salt.len() > 1, "retrievers spread an expression over the ranks: {by_salt:?}");
+        assert!((0..64).all(|i| rank_choice(i, "x", 3) < 3), "always a live rank");
+    }
+
     #[test]
     fn test_record_retriever_options() {
         let mut options = RecordRetrieverOptions::new();
@@ -1441,20 +1640,19 @@ mod tests {
 
     // ==================== Error classification ====================
 
-    // An exit or a connection failure fails over.
+    // An exit, a connection failure, or a request lost after it was sent in
+    // full (`Http`) fails over: a look-up is safe to try on another cluster.
     #[test]
-    fn exits_and_connection_failures_trigger_failover() {
+    fn exits_connection_and_http_failures_trigger_failover() {
         assert!(is_failover_trigger(&KineticaError::Exit("Kinetica is exiting".into())));
         assert!(is_failover_trigger(&KineticaError::Connection("refused".into())));
+        assert!(is_failover_trigger(&KineticaError::Http("Failed to read response".into())));
     }
 
-    // A submit failure (`Http`) does not fail over, though it used to be taken
-    // as a connection failure. Nor does an ordinary server error such as a bad
-    // filter.
+    // An ordinary server error such as a bad filter does not fail over.
     #[test]
     fn other_failures_do_not_trigger_failover() {
         for e in [
-            KineticaError::Http("Failed to read response".into()),
             KineticaError::Api("Invalid expression".into()),
             KineticaError::Config("No shard mapping".into()),
             KineticaError::Unauthorized("denied".into()),
@@ -1715,6 +1913,50 @@ mod server_tests {
     // A lookup with key values: a filter of the key, with a fast
     // index lookup, sent to the worker owning the key's shard, and the
     // records decoded by the retriever's type.
+    // A lookup retried after a failure that changed the shard mapping asks for
+    // the same page again, not the first one.
+    #[tokio::test]
+    async fn a_retried_lookup_keeps_its_offset() {
+        let head = fake_server::start("127.0.0.66").await;
+        let worker = fake_server::start("127.0.0.67").await;
+        // The mapping is version 1 until the worker fails, and 2 after
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mapping = changed.clone();
+        *head.behavior.handler.lock() = Some(Arc::new(move |path: &str, _: &[u8]| {
+            if path.ends_with("/show/table") {
+                Some(Ok(table_response(&[])))
+            } else if path.ends_with("/admin/show/shards") {
+                Some(Ok(shards_response(if mapping.load(Ordering::SeqCst) { 2 } else { 1 })))
+            } else {
+                None
+            }
+        }));
+        let requests: Requests = Arc::default();
+        let received = requests.clone();
+        *worker.behavior.handler.lock() = Some(Arc::new(move |path: &str, body: &[u8]| {
+            if !path.ends_with("/get/records") {
+                return None;
+            }
+            received.lock().push(
+                serde_avro_fast::from_datum_slice(body, &crate::generated::GET_RECORDS_REQUEST_SCHEMA).unwrap(),
+            );
+            if !changed.swap(true, Ordering::SeqCst) {
+                return Some(Err("Shard is being moved".to_string()));
+            }
+            Some(Ok(records_response(&[Row { id: 7, name: None }], &[])))
+        }));
+        let k = connect(&head, &[&worker]).await;
+
+        let retriever = RecordRetriever::new(k, "t", record_type()).await.expect("retriever");
+        retriever
+            .get_by_key_with_offset(&[ShardKeyValue::Int(7)], None, 20)
+            .await
+            .expect("answered on the retry");
+
+        let offsets: Vec<i64> = requests.lock().iter().map(|r| r.offset).collect();
+        assert_eq!(offsets, [20, 20], "the retry asks for the same page");
+    }
+
     #[tokio::test]
     async fn a_key_lookup_goes_to_the_worker_owning_the_key_and_is_decoded() {
         let head = fake_server::start("127.0.0.51").await;
@@ -1816,6 +2058,169 @@ mod server_tests {
 
         retriever.get_by_key(&[], None).await.expect("all records");
         assert_eq!(head_requests.lock().len(), 1);
+    }
+
+    /// The pages of a lookup on a replicated table all come from one worker,
+    /// even when other lookups run between them: each rank holds the table
+    /// in its own order, so a page from another could repeat or skip records.
+    #[tokio::test]
+    async fn a_replicated_lookups_pages_stay_on_one_worker_around_other_lookups() {
+        let head = fake_server::start("127.0.0.68").await;
+        let first = fake_server::start("127.0.0.69").await;
+        let second = fake_server::start("127.0.0.70").await;
+        serve_table(&head, &["REPLICATED"], false);
+        let first_requests = serve_records(&first, vec![(1, None)], &[]);
+        let second_requests = serve_records(&second, vec![(1, None)], &[]);
+        let k = connect(&head, &[&first, &second]).await;
+        let retriever = RecordRetriever::new(k, "t", record_type()).await.expect("retriever");
+
+        for (page, other) in (0..8).map(|i| (i as i64, format!("id > {}", 100 + i))) {
+            retriever.get_by_key_with_offset(&[], Some("id > 0"), page).await.expect("a page of the lookup");
+            retriever.get_by_key(&[], Some(&other)).await.expect("another lookup in between");
+        }
+
+        let on = |requests: &Requests| {
+            requests.lock().iter().filter(|r| r.options.get("expression").map(String::as_str) == Some("id > 0")).count()
+        };
+        let (on_first, on_second) = (on(&first_requests), on(&second_requests));
+        assert!(matches!((on_first, on_second), (8, 0) | (0, 8)), "{on_first} and {on_second}");
+    }
+
+    /// A `/get/records` answer holding `rows` out of `total`.
+    fn page_response(rows: &[Row], total: i64, has_more: bool) -> Vec<u8> {
+        let schema: serde_avro_fast::Schema = record_type().schema_string().parse().unwrap();
+        let response = RawGetRecordsResponse {
+            table_name: "t".to_string(),
+            type_name: "t_type".to_string(),
+            type_schema: record_type().schema_string().to_string(),
+            records_binary: rows.iter().map(|r| ByteBuf::from(encode(&schema, r))).collect(),
+            records_json: Vec::new(),
+            total_number_of_records: total,
+            has_more_records: has_more,
+            info: HashMap::new(),
+        };
+        encode(&crate::generated::GET_RECORDS_RESPONSE_SCHEMA, &response)
+    }
+
+    /// Serves `/get/records` from `server` out of `count` rows, honoring each
+    /// request's offset and limit; records the requests.
+    fn serve_pages(server: &FakeServer, count: i64) -> Requests {
+        let requests: Requests = Arc::default();
+        let received = requests.clone();
+        let previous = server.behavior.handler.lock().clone();
+        *server.behavior.handler.lock() = Some(Arc::new(move |path: &str, body: &[u8]| {
+            if !path.ends_with("/get/records") {
+                return previous.as_ref().and_then(|handle| handle(path, body));
+            }
+            let request: GetRecordsRequest =
+                serde_avro_fast::from_datum_slice(body, &crate::generated::GET_RECORDS_REQUEST_SCHEMA).unwrap();
+            let end = if request.limit > 0 { (request.offset + request.limit).min(count) } else { count };
+            let rows: Vec<Row> = (request.offset..end).map(|id| Row { id: id as i32, name: None }).collect();
+            received.lock().push(request);
+            Some(Ok(page_response(&rows, count, end < count)))
+        }));
+        requests
+    }
+
+    // A lookup reads its records a page at a time, of the size asked for,
+    // and knows how many there are from its first page.
+    #[tokio::test]
+    async fn a_lookup_reads_its_records_a_page_at_a_time() {
+        let head = fake_server::start("127.0.0.73").await;
+        let worker = fake_server::start("127.0.0.74").await;
+        serve_table(&head, &[], false);
+        let requests = serve_pages(&head, 25);
+        let k = connect(&head, &[&worker]).await;
+        let retriever = RecordRetriever::new(k, "t", record_type()).await.expect("retriever");
+
+        let mut lookup = retriever.lookup(&[], Some("id >= 0"), 10).expect("lookup");
+        assert_eq!(lookup.size().await.expect("size"), 25);
+        let mut ids = Vec::new();
+        while let Some(record) = lookup.next().await.expect("record") {
+            match record.get(0) {
+                Some(RecordValue::Int(id)) => ids.push(*id),
+                other => panic!("an id, not {other:?}"),
+            }
+        }
+        assert_eq!(ids, (0..25).collect::<Vec<_>>());
+        assert!(lookup.next().await.expect("after the end").is_none());
+        let pages: Vec<(i64, i64)> = requests.lock().iter().map(|r| (r.offset, r.limit)).collect();
+        assert_eq!(pages, [(0, 10), (10, 10), (20, 10)], "the first page read once, for the size and the records");
+    }
+
+    // On a replicated table every page of a lookup comes from one worker,
+    // whatever other lookups do between its pages.
+    #[tokio::test]
+    async fn a_replicated_tables_lookup_reads_every_page_from_one_worker() {
+        let head = fake_server::start("127.0.0.75").await;
+        let first = fake_server::start("127.0.0.76").await;
+        let second = fake_server::start("127.0.0.77").await;
+        serve_table(&head, &["REPLICATED"], false);
+        let (first_requests, second_requests) = (serve_pages(&first, 6), serve_pages(&second, 6));
+        let k = connect(&head, &[&first, &second]).await;
+        let retriever = RecordRetriever::new(k, "t", record_type()).await.expect("retriever");
+
+        let mut lookup = retriever.lookup(&[], Some("id >= 0"), 2).expect("lookup");
+        let mut read = 0;
+        while lookup.next().await.expect("record").is_some() {
+            read += 1;
+            retriever.get_by_key(&[], Some(&format!("id > {read}"))).await.expect("another lookup");
+        }
+        assert_eq!(read, 6);
+        let of_lookup = |requests: &Requests| -> Vec<i64> {
+            requests.lock().iter().filter(|r| r.limit == 2).map(|r| r.offset).collect()
+        };
+        let (on_first, on_second) = (of_lookup(&first_requests), of_lookup(&second_requests));
+        assert!(
+            (on_first == [0, 2, 4] && on_second.is_empty()) || (on_second == [0, 2, 4] && on_first.is_empty()),
+            "{on_first:?} and {on_second:?}"
+        );
+    }
+
+    // A replicated table's lookup fails rather than go on from another rank
+    // once the shard mapping changes during it.
+    #[tokio::test]
+    async fn a_replicated_tables_lookup_fails_when_the_mapping_changes_during_it() {
+        let head = fake_server::start("127.0.0.78").await;
+        let first = fake_server::start("127.0.0.79").await;
+        let second = fake_server::start("127.0.0.72").await;
+        // The mapping is version 1 until another lookup fails, and 2 after
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mapping = changed.clone();
+        *head.behavior.handler.lock() = Some(Arc::new(move |path: &str, _: &[u8]| {
+            if path.ends_with("/show/table") {
+                Some(Ok(table_response(&["REPLICATED"])))
+            } else if path.ends_with("/admin/show/shards") {
+                Some(Ok(shards_response(if mapping.load(Ordering::SeqCst) { 2 } else { 1 })))
+            } else {
+                None
+            }
+        }));
+        for worker in [&first, &second] {
+            let changed = changed.clone();
+            *worker.behavior.handler.lock() = Some(Arc::new(move |path: &str, body: &[u8]| {
+                if !path.ends_with("/get/records") {
+                    return None;
+                }
+                let request: GetRecordsRequest =
+                    serde_avro_fast::from_datum_slice(body, &crate::generated::GET_RECORDS_REQUEST_SCHEMA).unwrap();
+                if request.options.get("expression").map(String::as_str) == Some("id > 100")
+                    && !changed.swap(true, Ordering::SeqCst)
+                {
+                    return Some(Err("Shard is being moved".to_string()));
+                }
+                let rows: Vec<Row> = (request.offset..(request.offset + 1).min(3)).map(|id| Row { id: id as i32, name: None }).collect();
+                Some(Ok(page_response(&rows, 3, request.offset + 1 < 3)))
+            }));
+        }
+        let k = connect(&head, &[&first, &second]).await;
+        let retriever = RecordRetriever::new(k, "t", record_type()).await.expect("retriever");
+
+        let mut lookup = retriever.lookup(&[], Some("id >= 0"), 1).expect("lookup");
+        assert!(lookup.next().await.expect("the first page").is_some());
+        retriever.get_by_key(&[], Some("id > 100")).await.expect("recovered by the new mapping");
+        let err = lookup.next().await.expect_err("the mapping changed");
+        assert!(err.to_string().contains("cannot go on from rank"), "{err}");
     }
 
     // A column retrieval types the response by its own schema and passes its

@@ -6,6 +6,7 @@
 //! a submit failure.
 
 use crate::hyper_client::RawResponse;
+use crate::retry_rules::RequestRetries;
 use crate::text_format::double_to_string;
 use crate::{Kinetica, KineticaError, END_OF_SET};
 use log::{debug, trace, warn};
@@ -185,13 +186,14 @@ impl Kinetica {
 
     /// Inserts JSON records through `insert_url`, a rank's `/insert/records`,
     /// to `/insert/records/json` beside it, as a JSON `BulkInserter` sends a
-    /// batch. It does not fail over.
+    /// batch: re-sent as `retries` allows, and not failed over.
     pub(crate) async fn insert_records_from_json_at(
         &self,
         insert_url: &str,
         json_records: &str,
         table_name: &str,
         insert_records_options: Option<&HashMap<String, String>>,
+        retries: &RequestRetries,
     ) -> Result<serde_json::Map<String, serde_json::Value>, KineticaError> {
         if json_records.is_empty() {
             return Err(KineticaError::Api("No records to insert".to_string()));
@@ -210,7 +212,7 @@ impl Kinetica {
         }
 
         let url = format!("{}{}", insert_url.trim_end_matches('/'), endpoint_url("/json", &options));
-        let json = self.submit_json_request_raw(&url, Some(json_records)).await?;
+        let json = self.submit_json_request_raw_with(&url, Some(json_records), retries).await?;
         match serde_json::from_str(&json).expect("checked when the response was read") {
             serde_json::Value::Object(map) => Ok(map),
             _ => unreachable!("checked when the response was read"),
@@ -272,28 +274,12 @@ impl Kinetica {
     async fn submit_json_request(&self, endpoint: &str, payload: Option<&str>) -> Result<String, KineticaError> {
         let mut url = self.url().ok_or_else(|| KineticaError::Connection("No URL available".to_string()))?;
         let original_url = url.clone();
-		// Number of re-sends when a rank was not ready; fail-over resets it.
-        let mut not_ready_resends = 0;
 
         loop {
             let current_cluster_switch_count = self.num_cluster_switches();
             let full_url = crate::gpudb::append_path_to_url(&url, endpoint).to_string();
             let error = match self.submit_json_request_raw(&full_url, payload).await {
                 Ok(json) => return Ok(json),
-                // A rank rebuilding its HA client refused the request before
-                // handling it: wait, then send it to the same server again,
-                // up to max_retries times, before failing over.
-                Err(e) if crate::gpudb::is_rank_not_ready(&e) && not_ready_resends < self.max_retries() => {
-                    let wait = crate::gpudb::rank_not_ready_wait(not_ready_resends);
-                    not_ready_resends += 1;
-                    warn!(
-                        "Endpoint {endpoint} at {url} is not ready: {e}; re-sending in {}s (re-send {not_ready_resends} of {})",
-                        wait.as_secs(),
-                        self.max_retries()
-                    );
-                    tokio::time::sleep(wait).await;
-                    continue;
-                }
                 Err(e @ (KineticaError::Exit(_) | KineticaError::Connection(_))) => {
                     warn!("Got an exit error when trying endpoint {endpoint} at {url}: {e}; switch URL...");
                     e
@@ -311,7 +297,6 @@ impl Kinetica {
                 Ok(new_url) => {
                     debug!("Switched to {new_url}");
                     url = new_url;
-                    not_ready_resends = 0;
                 }
                 Err(KineticaError::HaUnavailable(ha) | KineticaError::FailoverDisabled(ha)) => {
                     return Err(crate::gpudb::failover_exhausted(&error, &ha));
@@ -321,29 +306,67 @@ impl Kinetica {
         }
     }
 
-    /// Sends one JSON request to `url`, without failing over.
+    /// Sends one JSON request to `url`, without failing over, re-sent to it
+    /// within the connection's budget.
     async fn submit_json_request_raw(&self, url: &str, payload: Option<&str>) -> Result<String, KineticaError> {
+        self.submit_json_request_raw_with(url, payload, &RequestRetries::connection_default()).await
+    }
+
+    /// Sends one JSON request to `url`, without failing over, re-sent to it
+    /// as `retries` allows.
+    async fn submit_json_request_raw_with(
+        &self,
+        url: &str,
+        payload: Option<&str>,
+        retries: &RequestRetries,
+    ) -> Result<String, KineticaError> {
         trace!("Sending request to {url}");
         let resp = self
             .hyper_client()
-            .post_json_raw(url, payload.map(str::to_string), &self.request_headers())
+            .post_json_with_retries(url, payload.map(str::to_string), &self.request_headers(), retries)
             .await?;
         interpret_json_response(url, &resp, payload.is_some())
     }
 }
 
-/// Interprets a JSON answer. With a payload, the answer must be a JSON
-/// object, which is read before anything else. An error whose message says
-/// the rank's HA client is not ready is an exit carrying that message,
-/// whatever the status, which `is_rank_not_ready` recognizes; a 400 whose
-/// message says the server is shutting down is an exit.
+/// Interprets a JSON answer, after the HTTP layer has made whatever re-sends
+/// it allowed (see [`crate::retry_rules`]).
+///
+/// - A text answer (an HTML page from a proxy, say) is decided by its text,
+///   then by its status: an exit where the client fails over from it, and
+///   reported otherwise.
+/// - With a payload, the answer must be a JSON object, and one whose
+///   `ERROR` says the rank's HA client is not ready is an exit whatever the
+///   status.
+/// - An answer with a status that is not a success is decided by its
+///   `message`, then by its status: an exit where it reports the server's
+///   state (offline, exiting, shutting down, draining its HA queue, starting
+///   up and the like), a rank not ready, a rank that failed while handling
+///   the request, or a status of `500`, `502`, `503` or `504`; unauthorized
+///   for a `401` or `403`; an API error for any other server error.
+///   Otherwise it is returned, with its `status` and `message` for the
+///   caller to read, as a `200` is.
 fn interpret_json_response(url: &str, resp: &RawResponse, posted: bool) -> Result<String, KineticaError> {
     let (status, reason) = (resp.status, resp.reason.as_str());
-    let json = String::from_utf8_lossy(&resp.body).into_owned();
+    trace!("<Status|Message|Type>: <{status}|{reason}|{:?}>", resp.content_type);
 
-    let object = if posted {
+    // An HTML page from the httpd, say; its text is the answer's message
+    if resp.content_type.as_deref().is_some_and(|ct| ct.starts_with("text")) {
+        let text = crate::retry_rules::text_reply_message(&resp.body);
+        return Err(crate::retry_rules::reply_failure(
+            url,
+            status,
+            reason,
+            Some(&text),
+            crate::retry_rules::text_reply_description(status, reason),
+        ));
+    }
+
+    let json = String::from_utf8_lossy(&resp.body).into_owned();
+    let object = if posted || !(200..300).contains(&status) {
         match serde_json::from_str::<serde_json::Value>(&json) {
             Ok(serde_json::Value::Object(map)) => Some(map),
+            _ if !posted => None,
             Ok(other) => {
                 return Err(KineticaError::Http(format!(
                     "Expected a JSON object in the response; found {}",
@@ -355,43 +378,22 @@ fn interpret_json_response(url: &str, resp: &RawResponse, posted: bool) -> Resul
     } else {
         None
     };
-    trace!("<Status|Message|Type|Response>: <{status}|{reason}|{:?}|{json}>", resp.content_type);
+    trace!("<Response>: <{json}>");
 
-    // An HTML page from the httpd, say
-    if resp.content_type.as_deref().is_some_and(|ct| ct.starts_with("text")) {
-        return Err(KineticaError::Http(format!(
-            "Cannot parse response from server: '{reason}'; status code: {status}"
-        )));
-    }
-
-    if status == 401 || status == 403 {
-        debug!("Got status code: {status}");
-        return Err(KineticaError::Unauthorized(format!("Server response status: {status} : {reason}")));
-    }
-
-	// Decided by the message before the status
-    if let Some(message) = object.as_ref().and_then(|object| object.get("message")).map(json_text) {
+    let message = object.as_ref().and_then(|object| object.get("message")).map(json_text);
+    if (200..300).contains(&status) {
+        // A rank that is not ready refuses the request whatever the status
         let is_error = object.as_ref().and_then(|object| object.get("status")).map(json_text).is_some_and(|s| s == "ERROR");
-        if is_error && crate::gpudb::is_rank_not_ready_message(&message) {
+        if let Some(message) = message.filter(|m| is_error && crate::retry_rules::is_rank_not_ready_message(m)) {
             debug!("Returning a rank-not-ready exit error from {url}; response_code: {status}; message: {message}");
             return Err(KineticaError::Exit(message));
         }
-    }
-
-    let exit_messages = ["Kinetica is exiting", "Connection refused", "Connection reset", "system-limited-fatal", "Kinetica is offline"];
-    if matches!(status, 500 | 502 | 503 | 504) || exit_messages.iter().any(|m| reason.contains(m)) {
-        debug!("Returning an exit error from {url}; response_code: {status}; content type {:?}; response message: {reason}", resp.content_type);
-        return Err(KineticaError::Exit(reason.to_string()));
-    }
-
-    if status == 400 {
-        if let Some(object) = &object {
-            let Some(message) = object.get("message") else {
-                return Err(KineticaError::Http("The response has no `message`".to_string()));
-            };
-            if json_text(message).contains("System shutting down") {
-                return Err(KineticaError::Exit("Kinetica shutting down".to_string()));
-            }
+    } else {
+        let description = message.clone().filter(|m| !m.is_empty()).unwrap_or_else(|| reason.to_string());
+        let failure = crate::retry_rules::reply_failure(url, status, reason, message.as_deref(), description);
+        // A JSON answer rejecting the request is the caller's to read
+        if !matches!(failure, KineticaError::Api(_)) || status >= 500 {
+            return Err(failure);
         }
     }
 
@@ -1032,12 +1034,19 @@ mod tests {
         assert!(classify(400, "Bad Request", None, r#"{"status":"ERROR","message":"bad"}"#, true).is_ok());
         assert!(matches!(
             classify(400, "Bad Request", None, r#"{"status":"ERROR","message":"System shutting down"}"#, true),
-            Err(KineticaError::Exit(m)) if m == "Kinetica shutting down"
+            Err(KineticaError::Exit(m)) if m == "System shutting down"
         ));
         assert!(matches!(classify(503, "Service Unavailable", None, "{}", true), Err(KineticaError::Exit(_))));
-        assert!(matches!(classify(200, "Kinetica is exiting", None, "{}", true), Err(KineticaError::Exit(_))));
+        assert!(matches!(classify(503, "Offline", None, "{}", true), Err(KineticaError::Exit(m)) if m == "Offline"));
         assert!(matches!(classify(401, "Unauthorized", None, "{}", true), Err(KineticaError::Unauthorized(_))));
-        assert!(matches!(classify(200, "OK", Some("text/html"), "{}", true), Err(KineticaError::Http(_))));
+        // A text answer is reported, or failed over from as its status says
+        assert!(matches!(
+            classify(200, "OK", Some("text/html"), "{}", true),
+            Err(KineticaError::Api(m)) if m == "Cannot parse response from server: 'OK'; status code: 200"
+        ));
+        assert!(matches!(classify(502, "Bad Gateway", Some("text/html"), "<html>", true), Err(KineticaError::Exit(m)) if m == "Bad Gateway"));
+        // A server error with no state to report goes back to the caller
+        assert!(matches!(classify(501, "Not Implemented", None, r#"{"message":"no"}"#, true), Err(KineticaError::Api(m)) if m == "no"));
         // Posted, the answer must be an object, read before the status
         assert!(matches!(classify(503, "Service Unavailable", None, "<html>", true), Err(KineticaError::Http(_))));
         // Without a payload it is not read
@@ -1045,16 +1054,34 @@ mod tests {
     }
 
     // A rank whose HA client is not ready is an exit carrying its message,
-    // whatever the status, and is recognized for a re-send.
+    // whatever the status.
     #[test]
     fn a_json_rank_not_ready_is_an_exit_whatever_the_status() {
         let message = "[HA] Unavailable: Producer not available";
         let body = format!(r#"{{"status":"ERROR","message":"{message}"}}"#);
-        for (status, reason) in [(400, "Bad Request"), (500, "Internal Server Error")] {
+        for (status, reason) in [(200, "OK"), (400, "Bad Request"), (500, "Internal Server Error")] {
             let err = interpret_json_response("http://h/x", &response(status, reason, None, &body), true).unwrap_err();
             assert!(matches!(err, KineticaError::Exit(ref m) if m == message), "{status}: {err:?}");
-            assert!(crate::gpudb::is_rank_not_ready(&err), "{status}: {err:?}");
         }
+    }
+
+    // Every server state fails over: draining its HA queue, starting up and
+    // the like.
+    #[test]
+    fn a_json_server_state_fails_over() {
+        for message in [
+            "Unavailable: Draining HA queue",
+            "Query planner is not running",
+            "Kinetica is starting up",
+            "Kinetica is restricted to admin users only",
+            "Kinetica is currently unable to process this message",
+        ] {
+            let body = format!(r#"{{"status":"ERROR","message":"{message}"}}"#);
+            let err = interpret_json_response("http://h/x", &response(400, "Bad Request", None, &body), true).unwrap_err();
+            assert!(matches!(err, KineticaError::Exit(ref m) if m == message), "{message}: {err:?}");
+        }
+        let err = interpret_json_response("http://h/x", &response(503, "Migrating", None, "{}"), true).unwrap_err();
+        assert!(matches!(err, KineticaError::Exit(_)), "{err:?}");
     }
 
     /// A response whose one record has `v` and whose `data` has `t`, both

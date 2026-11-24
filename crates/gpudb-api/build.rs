@@ -1,5 +1,5 @@
 //! Records what the client reports of itself: the compiler version, which it
-//! reports in its `User-Agent` header, and the API version.
+//! reports in its `X-Kinetica-Client` header, and the API version.
 //!
 //! The API version is the crate's own SemVer version, `MAJOR.MINOR.PATCH`:
 //! `MAJOR.MINOR` is the Kinetica version the crate implements, and `PATCH`

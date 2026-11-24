@@ -87,8 +87,8 @@ on the crate as `"~7.2"` to take every release for Kinetica 7.2 and none for a
 later Kinetica version; Cargo's default for a plain `"7.2.3"` would also accept
 `7.3` and later.
 
-`Kinetica::api_version()` gives the version (`7.2.3`), and the `User-Agent`
-header carries it (`kinetica-api-rust/7.2.3`).
+`Kinetica::api_version()` gives the version (`7.2.3`), and the
+`X-Kinetica-Client` header carries it (`kinetica-api-rust/7.2.3`).
 
 ### Building for Other Platforms
 
@@ -660,7 +660,8 @@ if inserter.error_count() > 0 {
     }
 }
 
-// Also check warnings
+// Also check warnings, which include records of a table with a primary key
+// that may already have been stored by an earlier copy of a re-sent batch
 let warnings = inserter.drain_warnings();
 ```
 
@@ -702,8 +703,9 @@ options
     .set_allow_partial_batch(true)        // Continue on partial failures
     .set_truncate_strings(true)           // Auto-truncate long strings
 
-    // Retry behavior: retries after a connection failure (default 3); then
-    // the inserter fails over to the next cluster, if there is one
+    // Retry behavior: re-sends of a batch to its worker (default 7), in
+    // place of the connection's; then the inserter fails over to the next
+    // cluster, if there is one
     .set_max_retries(5)
 
     // Backpressure control
@@ -1091,6 +1093,21 @@ for record in &response.data {
 }
 ```
 
+A lookup that matches many records can be read a page at a time with
+`lookup`, which takes the key values, a filter expression and a page size:
+
+```rust
+let mut lookup = retriever.lookup(&[], Some("region = 'EMEA'"), 1000)?;
+println!("{} records", lookup.size().await?);
+while let Some(record) = lookup.next().await? {
+    println!("{:?}", record.get(0));
+}
+```
+
+On a replicated table every page of a lookup comes from one worker rank, since
+each rank holds the table in its own order; if the cluster or its shard mapping
+changes during the lookup, it fails rather than continue from another rank.
+
 
 ## SQL
 
@@ -1458,7 +1475,7 @@ pub struct KineticaOptions {
     pub disable_auto_discovery: bool,     // Disable automatic cluster/worker discovery
     pub ha_failover_order: HaFailoverOrder, // Failover order (Sequential, the default, or Random)
     pub http_headers: HashMap<String, String>, // Extra HTTP headers sent with each request
-    pub client_name: Option<String>,      // Client program name, first in the User-Agent
+    pub client_name: Option<String>,      // Client program name, first in X-Kinetica-Client
     pub client_version: Option<String>,   // Client program version
     pub tcp_keep_alive: bool,             // TCP keep-alive probes (default on, system timings)
     pub tcp_keep_idle: u32,               // Seconds idle before the first probe (0 = system's)
@@ -1470,14 +1487,15 @@ pub struct KineticaOptions {
     pub initial_connection_attempt_timeout: u64, // How long to keep retrying the first connection, in ms
     pub max_total_connections: usize,     // Requests in flight across all hosts (default 40)
     pub max_connections_per_host: usize,  // Requests in flight to one host (default 10)
-    pub max_retries: usize,               // HTTP retries on the same server before failing over (default 5)
+    pub max_retries: usize,               // Re-sends to the same server before failing over (default 3)
     pub failback_polling_interval: u64,   // Seconds between checks for the primary after a failover
 }
 ```
 
 ### HTTP Headers
 
-Every request carries the `http_headers`, a `User-Agent`
+Every request carries the `http_headers`, an `X-Kinetica-Client` identifying the
+client to the server
 (`MyApp/1.0 kinetica-api-rust/<version> (Rust/<rustc>; <os>/<version>; <arch>)`, the
 client program first when `set_client_info` names one), the `Authorization` and,
 when an HA synchronicity override is set, `X-Kinetica-Group`. The headers the client
@@ -1485,21 +1503,39 @@ sets itself cannot be set through `http_headers`, except that `Basic` credential
 an `Authorization` header are used, and an `X-Kinetica-Group` header names the
 starting `HaSynchronicityMode`. Headers can be added and removed later with
 `Kinetica::add_http_header` and `remove_http_header`, and the mode changed with
-`set_ha_sync_mode`.
+`set_ha_sync_mode`. No `User-Agent` is sent unless you set one, as any other
+header.
 
 ### HA Failover and Fail-Back
 
-A request is first retried on the same server, at once and up to `max_retries`
-times (default 5), when it cannot be sent or the server answers 502 or 503. It
-then fails over to the next cluster when the server cannot serve it (it is
-unreachable, exiting, offline or returns a gateway error), but not for an
-ordinary API error or an authentication failure.
+A request is first sent again to the same server, up to `max_retries` times in
+all (default 3), where a second copy may get past the failure: it could not be
+sent, or was lost before it was written in full, or the server or a gateway
+answers 502, 503 or 504 without reporting the server's state. What the server
+says is read before the status, so a 503 saying the server is offline is not
+sent again. A cluster that has just come back online answers for a few seconds
+that a rank's HA client is not ready; a request it refuses this way is sent
+again after a wait of 1 second before the first re-send and twice as long before
+each one after it, at most 8 seconds.
 
-A cluster that has just come back online answers for a few seconds that a rank's
-HA client is not ready. A request it refuses this way is sent to the same server
-again, waiting 1 second before the first re-send and twice as long before each
-one after it, at most 8 seconds, up to `max_retries` times, and then fails over.
-A `BulkInserter` batch does the same within the inserter's own `max_retries`.
+A request lost after it was written in full (no response in time, or the
+connection closed first) may have been applied, so it is not sent to the same
+server again; nor is one a rank failed while handling. The client's own reads of
+table, type, shard and server metadata, and listings of KiFS files and
+directories, are the exception, as a second copy changes nothing.
+
+The request then fails over to the next cluster when the server cannot serve it:
+it is unreachable, reports its state (exiting, offline, shutting down, starting
+up, draining its HA queue and the like), returns a gateway or server error, or
+may have applied the request. An ordinary API error or an authentication failure
+is not failed over.
+
+A `BulkInserter` batch has its own budget of re-sends, the inserter's
+`max_retries` (default 7), in place of the connection's. A batch into a table
+with a primary key is also sent again when its first copy's outcome is unknown,
+since the server skips a record whose key is already stored; records that the
+second copy finds already stored are reported by `drain_warnings()` as records
+that may already have been stored, not as errors.
 
 Once a failover has moved the connection off the primary cluster, the primary is
 checked every `failback_polling_interval` seconds (default 5), and the connection
